@@ -1,6 +1,6 @@
 # Every 5 minutes: the newest KNMI precipitation nowcast (radar_forecast, now -> +2 h) as a COG in R2.
 # GitHub often starts scheduled runs some minutes late; a small server can take this over later (docs/20 §8).
-name: Nowcast (5 min)
+name: Nowcast + health (5 min)
 
 on:
   schedule:
@@ -34,3 +34,16 @@ jobs:
           R2_BUCKET: winemap-wx
           WX_STORE: r2
         run: python -m winemap_ingest.nowcast
+      - name: Health check (site up, data fresh, jobs) -> monitor/state.json + ntfy on a change
+        if: always()
+        env:
+          KNMI_API_KEY: ${{ secrets.KNMI_API_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: winemap-wx
+          WX_STORE: r2
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python -m winemap_ingest.health
