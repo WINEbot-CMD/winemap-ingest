@@ -23,6 +23,8 @@ SITES = {
     "staging": "https://staging-winemap-nl.wopferu.workers.dev/",
 }
 STATE = "monitor/state.json"
+STATUS = "https://staging-winemap-nl.wopferu.workers.dev/api/status"  # has the free-plan meter (also live, later)
+QUOTA_ALERT = 0.8
 INGEST_RUNS = "https://api.github.com/repos/WINEbot-CMD/winemap-ingest/actions/runs?per_page=30"
 NOWCAST_LATE = timedelta(minutes=45)
 RAIN_LATE = timedelta(hours=12)  # the hourly job catches up slowly while the KNMI limit is shared
@@ -94,6 +96,19 @@ def failing_jobs() -> dict[str, int]:
     return out
 
 
+def plan_use(headers: dict[str, str]) -> dict:
+    """The free-plan meter from /api/status (Worker requests, R2, Analytics Engine): name -> share used (0..1)."""
+    if not headers:
+        return {}
+    try:
+        req = urllib.request.Request(STATUS, headers={"User-Agent": "winemap-health", **headers})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            q = json.loads(r.read()).get("quota") or {}
+    except Exception:  # noqa: BLE001
+        return {}
+    return {k: v["used"] / v["limit"] for k, v in q.items() if isinstance(v, dict) and v.get("limit")}
+
+
 def problems(state: dict, now: datetime) -> dict[str, str]:
     """The problems right now: key -> message."""
     out = {}
@@ -106,6 +121,9 @@ def problems(state: dict, now: datetime) -> dict[str, str]:
     rain = _parse(state["data"].get("rain_hour"))
     if rain and now - rain > RAIN_LATE:
         out["rain"] = f"Rain sums are {round((now - rain).total_seconds() / 3600)} h behind"
+    for name, share in state.get("plan", {}).items():
+        if share >= QUOTA_ALERT:
+            out[f"plan:{name}"] = f"Free plan: {name} at {round(share * 100)} %"
     for name, n in state["jobs_failing"].items():
         if n >= 3:
             out[f"job:{name}"] = f"Job '{name}' failed {n} times in a row"
@@ -127,7 +145,9 @@ def notify(topic: str, title: str, message: str, priority: str = "default", tags
         print(f"ntfy failed: {e}")
 
 
-def run(store, now: datetime | None = None, sites=None, quota=None, jobs=None, send=notify, log=print) -> dict:
+def run(
+    store, now: datetime | None = None, sites=None, quota=None, jobs=None, plan=None, send=notify, log=print
+) -> dict:
     now = now or datetime.now(UTC)
     old = json.loads(store.get(STATE) or b"{}")
     headers = {}
@@ -149,6 +169,7 @@ def run(store, now: datetime | None = None, sites=None, quota=None, jobs=None, s
         "knmi": quota if quota is not None else knmi_quota(os.environ.get("KNMI_API_KEY", "")),
         "data": {"nowcast": nc.get("run"), "rain_hour": (rain.get("hour") or {}).get("last")},
         "jobs_failing": jobs if jobs is not None else failing_jobs(),
+        "plan": plan if plan is not None else plan_use(headers),
     }
     now_p = problems(state, now)
     was = old.get("problems", {})

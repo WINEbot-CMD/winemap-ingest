@@ -25,7 +25,14 @@ def test_alerts_only_when_a_problem_starts_or_ends(tmp_path):
 
     def run(t, sites):
         return health.run(
-            store, now=t, sites=sites, quota={"remaining": 500, "limit": 1000}, jobs={}, send=send, log=lambda *_: None
+            store,
+            now=t,
+            sites=sites,
+            quota={"remaining": 500, "limit": 1000},
+            jobs={},
+            plan={},
+            send=send,
+            log=lambda *_: None,
         )
 
     run(NOW, up())
@@ -43,3 +50,8 @@ def test_alerts_only_when_a_problem_starts_or_ends(tmp_path):
     assert health.problems({"sites": {}, "data": {}, "jobs_failing": {"Rain sums (hourly)": 3}}, NOW) == {
         "job:Rain sums (hourly)": "Job 'Rain sums (hourly)' failed 3 times in a row"
     }
+
+
+def test_free_plan_alert_from_80_percent():
+    st = {"sites": {}, "data": {}, "jobs_failing": {}, "plan": {"r2ClassA": 0.81, "workers": 0.2}}
+    assert health.problems(st, NOW) == {"plan:r2ClassA": "Free plan: r2ClassA at 81 %"}
