@@ -55,6 +55,28 @@ def check_site(url: str, headers: dict[str, str]) -> dict:
     return {"ok": ok, "ms": round((time.monotonic() - t0) * 1000), "detail": detail}
 
 
+def check_nowcast_path(site: str, headers: dict[str, str]) -> dict:
+    """What Live (2 h) does in the browser: the nowcast index through the site's /wx route, then a range read of
+    the nowcast COG it points at. ok = both work; age = minutes since the run."""
+    base = site.rstrip("/")
+    h = {"User-Agent": "winemap-health", **headers}
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(f"{base}/wx/rain/nowcast/index.json", headers=h), timeout=20
+        ) as r:
+            idx = json.loads(r.read())
+        req = urllib.request.Request(f"{base}/wx/rain/{idx['file']}", headers={**h, "Range": "bytes=0-1023"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            part = r.read()
+            ok = r.status == 206 and part[:2] in (b"II", b"MM")  # a TIFF, cut by the range
+            detail = "ok" if ok else f"COG answered {r.status}, {len(part)} bytes"
+        run = _parse(idx.get("run"))
+        age = round((datetime.now(UTC) - run).total_seconds() / 60) if run else None
+        return {"ok": ok, "detail": detail, "age_min": age}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "detail": str(e)[:160], "age_min": None}
+
+
 def knmi_quota(key: str) -> dict | None:
     if not key:
         return None
@@ -115,6 +137,8 @@ def problems(state: dict, now: datetime) -> dict[str, str]:
     for name, s in state["sites"].items():
         if not s["ok"]:
             out[f"site:{name}"] = f"Winemap {name} is down: {s['detail']}"
+        elif s.get("nowcast") and not s["nowcast"]["ok"]:
+            out[f"wx:{name}"] = f"Live 2 h on {name} cannot read the nowcast: {s['nowcast']['detail']}"
     nc = _parse(state["data"].get("nowcast"))
     if nc and now - nc > NOWCAST_LATE:
         out["nowcast"] = f"Nowcast is {round((now - nc).total_seconds() / 60)} min old"
@@ -158,6 +182,10 @@ def run(
         }
     # without the Access service token every check would only see the login page: then no site check (no false alarms)
     checked = sites if sites is not None else ({n: check_site(u, headers) for n, u in SITES.items()} if headers else {})
+    if headers and sites is None:  # the 2-hour Live path, per site
+        for name, url in SITES.items():
+            if name in checked:
+                checked[name]["nowcast"] = check_nowcast_path(url, headers)
     for name, s in checked.items():  # since when up / down
         prev = old.get("sites", {}).get(name)
         s["since"] = prev["since"] if prev and prev.get("ok") == s["ok"] else _iso(now)
