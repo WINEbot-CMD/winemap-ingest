@@ -393,7 +393,7 @@ def main(argv: list[str] | None = None) -> None:
     elif a.cmd == "final":
         index = refresh_final(store, Knmi(keep=10), a.zips)
     else:
-        index = live(store, Knmi(keep=200), a.max_hours)  # leaves room for the nowcast (24 requests an hour)
+        index = live(store, Knmi(keep=60), a.max_hours)  # own key now: leaves room for the nowcast + health (~36/h)
     print(json.dumps({k: index[k] for k in ("hour", "day", "final_until")}))
 
 

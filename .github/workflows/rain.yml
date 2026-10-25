@@ -38,4 +38,4 @@ jobs:
           WX_STORE: r2
         run: |
           if [ -z "$R2_ACCOUNT_ID" ]; then echo "R2 is not set up yet: nothing to do"; exit 0; fi
-          python -m winemap_ingest.rain live --max-hours "${{ inputs.max_hours || '48' }}"
+          python -m winemap_ingest.rain live --max-hours "${{ inputs.max_hours || '60' }}"
