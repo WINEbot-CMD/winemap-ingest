@@ -17,9 +17,10 @@ from datetime import UTC, datetime, timedelta
 from .knmi import API
 from .store import open_store
 
+# the home page: every version of the site has it (the /api routes only exist after the monitoring release)
 SITES = {
-    "live": "https://winemap-nl.wopferu.workers.dev/api/status",
-    "staging": "https://staging-winemap-nl.wopferu.workers.dev/api/status",
+    "live": "https://winemap-nl.wopferu.workers.dev/",
+    "staging": "https://staging-winemap-nl.wopferu.workers.dev/",
 }
 STATE = "monitor/state.json"
 INGEST_RUNS = "https://api.github.com/repos/WINEbot-CMD/winemap-ingest/actions/runs?per_page=30"
@@ -45,8 +46,8 @@ def check_site(url: str, headers: dict[str, str]) -> dict:
         req = urllib.request.Request(url, headers={"User-Agent": "winemap-health", **headers})
         with urllib.request.urlopen(req, timeout=20) as r:
             body = r.read()
-            ok = r.status == 200 and body.startswith(b"{")
-            detail = "ok" if ok else f"HTTP {r.status}, not the status answer (Access login page?)"
+            ok = r.status == 200 and b"Winemap" in body and b"cloudflareaccess" not in body
+            detail = "ok" if ok else f"HTTP {r.status}, not the Winemap page (Access login page?)"
     except Exception as e:  # noqa: BLE001
         ok, detail = False, str(e)[:160]
     return {"ok": ok, "ms": round((time.monotonic() - t0) * 1000), "detail": detail}
