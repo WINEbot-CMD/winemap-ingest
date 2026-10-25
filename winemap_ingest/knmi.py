@@ -63,6 +63,20 @@ class Knmi:
             if not token or not j.get("isTruncated") or len(out) >= limit:
                 return out
 
+    def list_files_desc(self, dataset: tuple[str, str], limit: int = 1) -> list[str]:
+        """The newest files (by creation time), newest first."""
+        name, version = dataset
+        q = {"maxKeys": str(limit), "orderBy": "created", "sorting": "desc"}
+        j = self._get(f"{API}/{name}/versions/{version}/files?{urllib.parse.urlencode(q)}")
+        return [f["filename"] for f in j.get("files", [])]
+
+    def file_info(self, dataset: tuple[str, str], limit: int = 100) -> dict[str, str]:
+        """File name -> lastModified, for datasets with a few files (the yearly archives)."""
+        name, version = dataset
+        q = {"maxKeys": str(limit), "orderBy": "filename", "sorting": "asc"}
+        j = self._get(f"{API}/{name}/versions/{version}/files?{urllib.parse.urlencode(q)}")
+        return {f["filename"]: f["lastModified"] for f in j.get("files", [])}
+
     def download(self, dataset: tuple[str, str], filename: str) -> bytes:
         name, version = dataset
         j = self._get(f"{API}/{name}/versions/{version}/files/{urllib.parse.quote(filename)}/url")

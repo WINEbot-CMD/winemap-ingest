@@ -15,6 +15,8 @@ in a Cloudflare R2 bucket:
 | `rain/cum/YYYY/YYYY-MM-DD.tif` | running total from `cum_start` to the end of that day |
 | `rain/mask.tif` | 1 = cells with data (the Netherlands, as in KNMI's final data) |
 | `rain/index.json` | the available hours and days, and up to when the data is final |
+| `rain/nowcast/YYYYMMDDHHMM.tif` | KNMI nowcast run: 25 bands, 5-minute steps now -> +2 h, in mm/h (kept a day) |
+| `rain/nowcast/index.json` | the newest nowcast run and its step times |
 
 A sum over any period (this season, or chosen days) is `cum[last day] − cum[day before the first]`: two files.
 
@@ -22,6 +24,10 @@ A sum over any period (this season, or chosen days) is `cum[last day] − cum[da
 
 - **Final** (gauge-adjusted, climatological): `rad_nl25_rac_mfbs_01h`, one zip per year, for the backfill.
 - **Real-time**: `nl_rdr_data_rtcor_5m`, 5-minute sums, added up per hour by the hourly job.
+- **Nowcast**: `radar_forecast` 2.0, a new run every 5 minutes (workflow `nowcast.yml`).
+
+Once a day (`final.yml`) the job checks whether KNMI updated the yearly archive and replaces the real-time hours
+with final ones, then makes the day sums and running totals again from there.
 
 `final_until` in the index tells which hours are final; later hours are real-time (replaced by final data later).
 Real-time data is cut to the same area as the final data, so sums over both stay comparable.

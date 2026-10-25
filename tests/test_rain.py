@@ -145,3 +145,46 @@ def test_live_scales_an_hour_with_a_few_files_missing_once_it_is_late(tmp_path, 
     hours = rain.read_cog(store.get("rain/hour/2026/2026-09-04.tif"))
     nl = ~np.isnan(rain.read_cog(store.get("rain/mask.tif"))[0])
     assert np.allclose(hours[8][nl], 1.2)  # 10 of 12 files, scaled up
+
+
+# ---------- final data replaces real-time hours ----------
+def test_final_data_replaces_real_time_hours_and_remakes_the_totals(tmp_path, final_zip):
+    store = LocalStore(tmp_path / "wx")
+    backfill(store, final_zip)
+    rain.live(
+        store,
+        FakeKnmi(datetime(2026, 9, 5, 8, 20, tzinfo=UTC)),
+        now=datetime(2026, 9, 5, 9, tzinfo=UTC),
+        log=lambda *_: None,
+    )
+    # KNMI's new archive: 2 mm in every hour of 4 Sep 08 .. 5 Sep 07 (the real-time data said 1.2)
+    new = tmp_path / "new.zip"
+    with zipfile.ZipFile(new, "w") as z:
+        t = datetime(2026, 9, 4, 8, tzinfo=UTC)
+        while t < datetime(2026, 9, 5, 8, tzinfo=UTC):
+            end = t + H
+            z.writestr(
+                f"RAD_NL25_RAC_MFBS_01H/2026/09/RAD_NL25_RAC_MFBS_01H_{end:%Y%m%d%H%M}_NL.h5", h5(2.0, nl_only=True)
+            )
+            t = end
+    name = "RADNL_CLIM____MFBSNL25_01H_20260101T000000_20270101T000000_0002.zip"
+
+    class Archive:
+        def file_info(self, dataset, limit=100):
+            return {name: "2026-10-15T00:16:02+00:00"}
+
+        def download(self, dataset, n):
+            return new.read_bytes()
+
+    index = rain.refresh_final(
+        store, Archive(), tmp_path / "zips", now=datetime(2026, 10, 16, tzinfo=UTC), log=lambda *_: None
+    )
+    assert index["final_until"] == "2026-09-05T08"
+    nl = ~np.isnan(rain.read_cog(store.get("rain/mask.tif"))[0])
+    assert np.allclose(rain.read_cog(store.get("rain/day/2026/2026-09-04.tif"))[0][nl], 48)
+    assert np.allclose(rain.read_cog(store.get("rain/cum/2026/2026-09-04.tif"))[0][nl], 36 + 48)
+    # the same archive again: nothing to do
+    again = rain.refresh_final(
+        store, Archive(), tmp_path / "zips", now=datetime(2026, 10, 17, tzinfo=UTC), log=lambda *_: None
+    )
+    assert again["final_until"] == "2026-09-05T08"

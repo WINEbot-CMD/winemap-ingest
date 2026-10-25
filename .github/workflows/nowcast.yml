@@ -1,0 +1,36 @@
+# Every 5 minutes: the newest KNMI precipitation nowcast (radar_forecast, now -> +2 h) as a COG in R2.
+# GitHub often starts scheduled runs some minutes late; a small server can take this over later (docs/20 §8).
+name: Nowcast (5 min)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nowcast
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  nowcast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Newest nowcast
+        env:
+          KNMI_API_KEY: ${{ secrets.KNMI_API_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: winemap-wx
+          WX_STORE: r2
+        run: python -m winemap_ingest.nowcast

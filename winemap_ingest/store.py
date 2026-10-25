@@ -21,6 +21,13 @@ class LocalStore:
         tmp.write_bytes(data)
         tmp.replace(p)
 
+    def list(self, prefix: str) -> list[str]:
+        base = self.root / prefix
+        return [p.relative_to(self.root).as_posix() for p in base.rglob("*") if p.is_file()] if base.exists() else []
+
+    def delete(self, key: str) -> None:
+        (self.root / key).unlink(missing_ok=True)
+
     def __repr__(self) -> str:
         return f"LocalStore({self.root})"
 
@@ -49,6 +56,15 @@ class R2Store:
 
     def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=data, ContentType=content_type)
+
+    def list(self, prefix: str) -> list[str]:
+        out: list[str] = []
+        for page in self.s3.get_paginator("list_objects_v2").paginate(Bucket=self.bucket, Prefix=prefix):
+            out += [o["Key"] for o in page.get("Contents", [])]
+        return out
+
+    def delete(self, key: str) -> None:
+        self.s3.delete_object(Bucket=self.bucket, Key=key)
 
     def __repr__(self) -> str:
         return f"R2Store({self.bucket})"

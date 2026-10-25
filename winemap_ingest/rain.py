@@ -13,6 +13,7 @@ sums, added up per hour, by the hourly job. `final_until` in the index says up t
 
     python -m winemap_ingest.rain backfill --zips DIR --start 2019-10-01T08 --until 2026-09-30T08
     python -m winemap_ingest.rain live [--max-hours 48]
+    python -m winemap_ingest.rain final --zips DIR      (daily: real-time hours -> final ones, when KNMI has them)
 """
 
 from __future__ import annotations
@@ -277,6 +278,47 @@ def download_final_zips(knmi: Knmi, years: range, folder: Path, log=print) -> li
     return out
 
 
+def refresh_final(store, knmi: Knmi, folder: Path, now: datetime | None = None, log=print) -> dict:
+    """KNMI updates the yearly archive of final hourly sums about once a month: then the real-time hours from
+    `final_until` on are replaced by final ones, and the days and running totals from there are made again."""
+    index = load_index(store)
+    if not index or not index.get("final_until"):
+        raise SystemExit("no index yet: run the backfill first")
+    until = parse_hour(index["final_until"])
+    now = now or datetime.now(UTC)
+    years = range(until.year, now.year + 1)
+    info = knmi.file_info(FINAL_HOURLY)
+    seen = index.setdefault("final_sources", {})
+    new = sorted(n for n, mod in info.items() if any(f"_01H_{y}0101T" in n for y in years) and seen.get(n) != mod)
+    if not new:
+        log("no new final data")
+        return index
+    live_last = parse_hour(index["hour"]["last"])
+    hours = Hours(store)
+    last = None
+    folder.mkdir(parents=True, exist_ok=True)
+    for name in new:
+        p = folder / name
+        p.write_bytes(knmi.download(FINAL_HOURLY, name))
+        with zipfile.ZipFile(p) as z:
+            for n in sorted(x for x in z.namelist() if x.endswith(".h5")):
+                t = end_time(n) - HOUR
+                if until <= t <= live_last:  # only hours we have as real-time: the live job adds newer ones
+                    hours.set(t, grid.to_rd(read_mm(z.read(n))))
+                    last = t if last is None or t > last else last
+        p.unlink()  # the archives are large; the store has what we need
+        seen[name] = info[name]
+    hours.flush()
+    if last is not None:
+        index["final_until"] = fmt_hour(last + HOUR)
+        if index.get("day"):
+            first = rain_day(until)
+            log(f"final data {fmt_hour(until)} .. {fmt_hour(last)}; days again from {first}")
+            make_days(store, hours, index, first, date.fromisoformat(index["day"]["last"]))
+    save_index(store, index)
+    return index
+
+
 # ---------- the hourly job: real-time 5-minute sums ----------
 def rt_name(t: datetime) -> str:
     return f"RAD_NL25_RAC_RT_{t:%Y%m%d%H%M}.h5"
@@ -339,6 +381,8 @@ def main(argv: list[str] | None = None) -> None:
     b.add_argument("--until", required=True, help="first hour NOT to take from the final data, e.g. 2026-09-30T08")
     lv = sub.add_parser("live")
     lv.add_argument("--max-hours", type=int, default=48)
+    fi = sub.add_parser("final")
+    fi.add_argument("--zips", type=Path, default=Path("data/zips"))
     a = ap.parse_args(argv)
     store = open_store(a.store)
     if a.cmd == "backfill":
@@ -346,6 +390,8 @@ def main(argv: list[str] | None = None) -> None:
         # one request per year: a small reserve is enough
         zips = download_final_zips(Knmi(keep=10), range(start.year, until.year + 1), a.zips)
         index = backfill(store, zips, start, until)
+    elif a.cmd == "final":
+        index = refresh_final(store, Knmi(keep=10), a.zips)
     else:
         index = live(store, Knmi(), a.max_hours)
     print(json.dumps({k: index[k] for k in ("hour", "day", "final_until")}))
