@@ -1,0 +1,41 @@
+# Every hour: add the newest KNMI radar hours to the precipitation sums in R2 (Winemap Live / Season, phase 1).
+name: Rain sums (hourly)
+
+on:
+  schedule:
+    - cron: "17 * * * *" # KNMI's 5-minute files arrive a few minutes late
+  workflow_dispatch:
+    inputs:
+      max_hours:
+        description: "Most hours to add in this run"
+        default: "48"
+
+concurrency:
+  group: rain # never two runs writing at the same time
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Add new hours
+        env:
+          KNMI_API_KEY: ${{ secrets.KNMI_API_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: winemap-wx
+          WX_STORE: r2
+        run: |
+          if [ -z "$R2_ACCOUNT_ID" ]; then echo "R2 is not set up yet: nothing to do"; exit 0; fi
+          python -m winemap_ingest.rain live --max-hours "${{ inputs.max_hours || '48' }}"
