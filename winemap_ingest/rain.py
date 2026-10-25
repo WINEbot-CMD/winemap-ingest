@@ -343,7 +343,8 @@ def main(argv: list[str] | None = None) -> None:
     store = open_store(a.store)
     if a.cmd == "backfill":
         start, until = parse_hour(a.start), parse_hour(a.until)
-        zips = download_final_zips(Knmi(), range(start.year, until.year + 1), a.zips)
+        # one request per year: a small reserve is enough
+        zips = download_final_zips(Knmi(keep=10), range(start.year, until.year + 1), a.zips)
         index = backfill(store, zips, start, until)
     else:
         index = live(store, Knmi(), a.max_hours)
