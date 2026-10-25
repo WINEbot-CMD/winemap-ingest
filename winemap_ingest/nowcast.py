@@ -17,7 +17,7 @@ import h5py
 import numpy as np
 
 from . import grid
-from .knmi import Knmi
+from .knmi import Knmi, OutOfRequests
 from .radar import _calibration
 from .rain import cog, load_mask
 from .store import open_store
@@ -90,7 +90,10 @@ def update(store, knmi: Knmi, now: datetime | None = None, log=print) -> dict | 
 
 
 def main() -> None:
-    update(open_store(), Knmi(keep=40))  # 2 requests a run; a small reserve keeps it going next to the hourly job
+    try:
+        update(open_store(), Knmi(keep=0))  # 2 requests a run, and it has priority: no reserve
+    except OutOfRequests as e:
+        print(f"skipped: {e}")  # the next run (in 5 minutes) tries again
 
 
 if __name__ == "__main__":

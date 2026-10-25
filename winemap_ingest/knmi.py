@@ -39,8 +39,8 @@ class Knmi:
                     body = r.read()
                 return body if raw else json.loads(body)
             except urllib.error.HTTPError as e:
-                if e.code == 429:
-                    raise OutOfRequests("KNMI answered 429 (too many requests)") from e
+                if e.code in (403, 429):  # KNMI answers 403 too when the key's hourly limit is used up
+                    raise OutOfRequests(f"KNMI answered {e.code} (request limit)") from e
                 if e.code >= 500 and attempt < 3:
                     time.sleep(5 * (attempt + 1))
                     continue
