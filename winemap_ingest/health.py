@@ -23,7 +23,7 @@ SITES = {
     "staging": "https://staging-winemap-nl.wopferu.workers.dev/",
 }
 STATE = "monitor/state.json"
-STATUS = "https://staging-winemap-nl.wopferu.workers.dev/api/status"  # has the free-plan meter (also live, later)
+STATUS = "https://winemap-nl.wopferu.workers.dev/api/status"  # live: it has the secrets for the free-plan meter
 QUOTA_ALERT = 0.8
 INGEST_RUNS = "https://api.github.com/repos/WINEbot-CMD/winemap-ingest/actions/runs?per_page=30"
 NOWCAST_LATE = timedelta(minutes=45)
