@@ -21,10 +21,11 @@ Each run picks up what is missing in the store, newest first, until its time or 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import tempfile
 import time
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import netCDF4
@@ -328,6 +329,48 @@ def pack_local_era5(store, raw_dir: Path, years: list[int], log=print) -> int:
     return done
 
 
+SOURCES = {
+    "knmi": ("KNMI", "Daily grids NL, 1 km (tg, tn, tx, rr)", KNMI_FIRST_YEAR),
+    "era5land": ("Copernicus (ECMWF)", "ERA5-Land Europe, 0.1° (tg, tn, tx, rr)", ERA5_FIRST_YEAR),
+}
+
+
+def progress(store, source: str, result: str, today: date | None = None) -> dict:
+    """Months in the store against the months that exist (1961 to last month), for the status page."""
+    today = today or date.today()
+    org, title, first = SOURCES[source]
+    region = "nl" if source == "knmi" else "eu"
+    keys = store.list(f"climate/{source}/{region}/")
+    months = sorted({k.rsplit("/", 1)[-1][:7] for k in keys})
+    total = ((today.year - first) * 12 + today.month - 1) * len(VARS)  # up to and including last month
+    return {
+        "org": org,
+        "title": title,
+        "files": len(keys),
+        "total": total,
+        "newest": months[-1] if months else None,
+        "oldest": months[0] if months else None,
+        "lastRun": datetime.now(UTC).isoformat(timespec="seconds"),
+        "lastResult": result,
+    }
+
+
+def report(source: str, store, result: str, log=print) -> None:
+    """monitor/climate.json in winemap-wx (read by /api/status). Never fails the run."""
+    try:
+        from .store import R2Store
+
+        if os.environ.get("CLIMATE_STORE", "r2") != "r2" or not os.environ.get("R2_ACCESS_KEY_ID"):
+            return
+        wx = R2Store(bucket="winemap-wx")
+        state = json.loads(wx.get("monitor/climate.json") or b"{}")
+        state[source] = progress(store, source, result)
+        state["updated"] = datetime.now(UTC).isoformat(timespec="seconds")
+        wx.put("monitor/climate.json", json.dumps(state, indent=1).encode(), "application/json")
+    except Exception as e:  # noqa: BLE001
+        log(f"status not written: {e}")
+
+
 def climate_store():
     """The private bucket (R2_CLIMATE_* credentials), or a folder for trial runs (CLIMATE_STORE=<folder>)."""
     where = os.environ.get("CLIMATE_STORE", "r2")
@@ -354,8 +397,10 @@ def main(argv: list[str] | None = None) -> None:
     if a.cmd == "knmi":
         api = Knmi(keep=50)  # KNMI_API_KEY; the workflow passes the download key, not the one of the rain jobs
         n = run_knmi(store, api, a.minutes, a.years)
+        report("knmi", store, f"{n} months written")
     elif a.cmd == "era5":
         n = run_era5(store, a.minutes, a.years)
+        report("era5land", store, f"{n} months written")
     elif a.cmd == "pack-knmi":
         n = pack_local_knmi(store, a.raw, a.years)
     else:

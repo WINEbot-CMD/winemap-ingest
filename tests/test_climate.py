@@ -119,3 +119,13 @@ def test_run_knmi_writes_missing_months_and_skips_done(tmp_path, monkeypatch):
     assert climate.run_knmi(store, api, minutes=5, years=(1961, 1961), log=lambda _: None) == 4
     assert api.downloads == 4 * 31
     assert climate.run_knmi(store, api, minutes=5, years=(1961, 1961), log=lambda _: None) == 0  # nothing left
+
+
+def test_progress_counts_months(tmp_path):
+    store = LocalStore(tmp_path)
+    for v in climate.VARS:
+        store.put(f"climate/knmi/nl/{v}/1961/1961-01.nc", b"x")
+        store.put(f"climate/knmi/nl/{v}/2026/2026-09.nc", b"x")
+    p = climate.progress(store, "knmi", "ok", today=date(2026, 10, 27))
+    assert p["files"] == 8 and p["total"] == (65 * 12 + 9) * 4
+    assert (p["oldest"], p["newest"], p["org"]) == ("1961-01", "2026-09", "KNMI")

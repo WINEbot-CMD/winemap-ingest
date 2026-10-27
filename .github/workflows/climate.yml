@@ -39,6 +39,8 @@ jobs:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_CLIMATE_ACCESS_KEY_ID: ${{ secrets.R2_CLIMATE_ACCESS_KEY_ID }}
           R2_CLIMATE_SECRET_ACCESS_KEY: ${{ secrets.R2_CLIMATE_SECRET_ACCESS_KEY }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }} # for monitor/climate.json in winemap-wx (status page)
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           if [ -z "$R2_CLIMATE_ACCESS_KEY_ID" ] || [ -z "$KNMI_API_KEY" ]; then echo "not set up yet: nothing to do"; exit 0; fi
           python -m winemap_ingest.climate knmi --minutes 50 ${{ inputs.years && format('--years {0}', inputs.years) || '' }}
@@ -63,6 +65,8 @@ jobs:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_CLIMATE_ACCESS_KEY_ID: ${{ secrets.R2_CLIMATE_ACCESS_KEY_ID }}
           R2_CLIMATE_SECRET_ACCESS_KEY: ${{ secrets.R2_CLIMATE_SECRET_ACCESS_KEY }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }} # for monitor/climate.json in winemap-wx (status page)
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           if [ -z "$R2_CLIMATE_ACCESS_KEY_ID" ] || [ -z "$CDS_API_KEY" ]; then echo "not set up yet: nothing to do"; exit 0; fi
           python -m winemap_ingest.climate era5 --minutes 320 ${{ inputs.years && format('--years {0}', inputs.years) || '' }}
