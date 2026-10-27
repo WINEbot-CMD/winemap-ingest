@@ -116,6 +116,15 @@ def knmi_day(name: str) -> date:
     return date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:8]))
 
 
+def latest_per_day(names: list[str]) -> list[str]:
+    """KNMI sometimes has a day twice (an older and a newer version, ..._0002.nc and ..._0006.nc; seen in 2017-2018):
+    keep the newest version of each day, in day order."""
+    best: dict[date, str] = {}
+    for n in sorted(names, key=lambda x: x.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]):
+        best[knmi_day(n.rsplit("/", 1)[-1].rsplit("\\", 1)[-1])] = n  # the version number sorts last: newest wins
+    return [best[d] for d in sorted(best)]
+
+
 def knmi_read(raw: bytes) -> tuple[np.ndarray, dict]:
     """One KNMI daily file: the grid (NaN = no data) and its x, y."""
     with netCDF4.Dataset("knmi.nc", memory=raw) as d:
@@ -144,7 +153,7 @@ def knmi_month_files(api: Knmi, var: str, year: int, month: int) -> list[str]:
     name, _ = KNMI_DATASETS[var]
     begin = f"INTER_OPER_R___{name.upper()}_____L3__{year}{month:02d}00"  # sorts just before the month's first file
     files = api.list_files(KNMI_DATASETS[var], begin=begin, limit=31)
-    return [f for f in files if knmi_day(f).year == year and knmi_day(f).month == month]
+    return latest_per_day([f for f in files if knmi_day(f).year == year and knmi_day(f).month == month])
 
 
 def months_newest_first(first_year: int, last: date, years: tuple[int, int] | None):
@@ -297,8 +306,9 @@ def pack_local_knmi(store, raw_dir: Path, years: list[int], log=print) -> int:
         for var, (name, version) in KNMI_DATASETS.items():
             folder = raw_dir / f"{name}_v{version}" / str(year)
             by_month: dict[int, list[Path]] = {}
-            for f in sorted(folder.glob("*.nc")):
-                by_month.setdefault(knmi_day(f.name).month, []).append(f)
+            files = {f.name: f for f in folder.glob("*.nc")}
+            for name in latest_per_day(list(files)):
+                by_month.setdefault(knmi_day(name).month, []).append(files[name])
             for month, files in sorted(by_month.items()):
                 full = (date(year + month // 12, month % 12 + 1, 1) - date(year, month, 1)).days
                 if len(files) < full:

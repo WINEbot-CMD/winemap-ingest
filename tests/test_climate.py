@@ -129,3 +129,10 @@ def test_progress_counts_months(tmp_path):
     p = climate.progress(store, "knmi", "ok", today=date(2026, 10, 27))
     assert p["files"] == 8 and p["total"] == (65 * 12 + 9) * 4
     assert (p["oldest"], p["newest"], p["org"]) == ("1961-01", "2026-09", "KNMI")
+
+
+def test_latest_version_per_day():
+    a = "INTER_OPER_R___TX1_____L3__20180101T000000_20180102T000000_0002.nc"
+    b = "INTER_OPER_R___TX1_____L3__20180101T000000_20180102T000000_0006.nc"
+    c = "INTER_OPER_R___TX1_____L3__20180102T000000_20180103T000000_0002.nc"
+    assert climate.latest_per_day([b, c, a]) == [b, c]
