@@ -120,8 +120,8 @@ def latest_per_day(names: list[str]) -> list[str]:
     """KNMI sometimes has a day twice (an older and a newer version, ..._0002.nc and ..._0006.nc; seen in 2017-2018):
     keep the newest version of each day, in day order."""
     best: dict[date, str] = {}
-    for n in sorted(names, key=lambda x: x.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]):
-        best[knmi_day(n.rsplit("/", 1)[-1].rsplit("\\", 1)[-1])] = n  # the version number sorts last: newest wins
+    for n in sorted(names):  # same day: the names differ only in the version number at the end, so newest sorts last
+        best[knmi_day(n)] = n
     return [best[d] for d in sorted(best)]
 
 
