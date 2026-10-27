@@ -54,3 +54,12 @@ close it stops and the next run continues where it stopped.
 On Windows with PostGIS installed, unset `PROJ_LIB` / `GDAL_DATA` first: the wheels bring their own PROJ data.
 
 Data: © KNMI, CC BY 4.0.
+
+## Climate data (Winemap docs/24)
+
+`winemap_ingest/climate.py` + `.github/workflows/climate.yml`: KNMI daily 1 km grids (tg, tn, tx, rr) and ERA5-Land
+Europe (0.1°) -> one int16 NetCDF per variable per month in the private R2 bucket `winemap-climate`
+(`climate/{knmi/nl,era5land/eu}/<var>/<year>/<year>-<mm>.nc`). Newest first; every run continues where the last
+stopped. Secrets: `KNMI_DOWNLOAD_KEY` (the download key, not the rain jobs' key), `CDS_API_KEY`,
+`R2_CLIMATE_ACCESS_KEY_ID`, `R2_CLIMATE_SECRET_ACCESS_KEY` (+ `R2_ACCOUNT_ID`). The laptop's own downloads go in with
+`python -m winemap_ingest.climate pack-knmi|pack-era5 <raw dir> <years>`.

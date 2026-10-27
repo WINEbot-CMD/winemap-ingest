@@ -35,7 +35,8 @@ class LocalStore:
 class R2Store:
     """R2 bucket through its S3 API (account id, access key and secret from the environment)."""
 
-    def __init__(self, bucket: str | None = None):
+    def __init__(self, bucket: str | None = None, creds: str = "R2"):
+        """creds = the prefix of the key variables: R2 (winemap-wx) or R2_CLIMATE (winemap-climate, docs/24)."""
         import boto3  # only needed online
 
         account = os.environ["R2_ACCOUNT_ID"]
@@ -43,8 +44,8 @@ class R2Store:
         self.s3 = boto3.client(
             "s3",
             endpoint_url=f"https://{account}.r2.cloudflarestorage.com",
-            aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-            aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+            aws_access_key_id=os.environ[f"{creds}_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ[f"{creds}_SECRET_ACCESS_KEY"],
             region_name="auto",
         )
 

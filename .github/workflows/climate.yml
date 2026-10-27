@@ -1,0 +1,68 @@
+# Climate data for the BCIs (Winemap docs/24): KNMI and ERA5-Land daily grids -> one small NetCDF per variable per
+# month in the private bucket winemap-climate. Each run continues where the last one stopped (newest first).
+name: Climate data
+
+on:
+  schedule:
+    - cron: "41 * * * *" # KNMI: every hour while the history fills (the limit is per hour); later once a day
+    - cron: "5 */6 * * *" # ERA5-Land: every 6 hours, a run waits in the CDS queue for most of its time
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "knmi or era5"
+        default: "knmi"
+      years:
+        description: "Optional: newest and oldest year, e.g. '2024 2020'"
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  knmi:
+    if: github.event.schedule == '41 * * * *' || (github.event_name == 'workflow_dispatch' && inputs.source == 'knmi')
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    concurrency:
+      group: climate-knmi
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Pack missing KNMI months
+        env:
+          KNMI_API_KEY: ${{ secrets.KNMI_DOWNLOAD_KEY }} # the download key (not the one of the rain jobs)
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_CLIMATE_ACCESS_KEY_ID: ${{ secrets.R2_CLIMATE_ACCESS_KEY_ID }}
+          R2_CLIMATE_SECRET_ACCESS_KEY: ${{ secrets.R2_CLIMATE_SECRET_ACCESS_KEY }}
+        run: |
+          if [ -z "$R2_CLIMATE_ACCESS_KEY_ID" ] || [ -z "$KNMI_API_KEY" ]; then echo "not set up yet: nothing to do"; exit 0; fi
+          python -m winemap_ingest.climate knmi --minutes 50 ${{ inputs.years && format('--years {0}', inputs.years) || '' }}
+
+  era5:
+    if: github.event.schedule == '5 */6 * * *' || (github.event_name == 'workflow_dispatch' && inputs.source == 'era5')
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    concurrency:
+      group: climate-era5 # CDS rules: one request after the other
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Request missing ERA5-Land months
+        env:
+          CDS_API_KEY: ${{ secrets.CDS_API_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_CLIMATE_ACCESS_KEY_ID: ${{ secrets.R2_CLIMATE_ACCESS_KEY_ID }}
+          R2_CLIMATE_SECRET_ACCESS_KEY: ${{ secrets.R2_CLIMATE_SECRET_ACCESS_KEY }}
+        run: |
+          if [ -z "$R2_CLIMATE_ACCESS_KEY_ID" ] || [ -z "$CDS_API_KEY" ]; then echo "not set up yet: nothing to do"; exit 0; fi
+          python -m winemap_ingest.climate era5 --minutes 320 ${{ inputs.years && format('--years {0}', inputs.years) || '' }}
