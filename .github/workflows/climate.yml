@@ -6,10 +6,12 @@ on:
   schedule:
     - cron: "41 * * * *" # KNMI: every hour while the history fills (the limit is per hour); later once a day
     - cron: "5 */6 * * *" # ERA5-Land: every 6 hours, a run waits in the CDS queue for most of its time
+    - cron: "35 2,8,14,20 * * *" # ERA5-Land hourly NL+BE+DK (docs/27): in the same CDS queue, between the daily runs
+    - cron: "20 4 * * *" # KNMI hourly station observations: once a day
   workflow_dispatch:
     inputs:
       source:
-        description: "knmi or era5"
+        description: "knmi, era5, era5-hourly or stations"
         default: "knmi"
       years:
         description: "Optional: newest and oldest year, e.g. '2024 2020'"
@@ -70,3 +72,51 @@ jobs:
         run: |
           if [ -z "$R2_CLIMATE_ACCESS_KEY_ID" ] || [ -z "$CDS_API_KEY" ]; then echo "not set up yet: nothing to do"; exit 0; fi
           python -m winemap_ingest.climate era5 --minutes 320 ${{ inputs.years && format('--years {0}', inputs.years) || '' }}
+
+  era5-hourly:
+    # winemap-nl docs/27 step 1: hourly temperature, dewpoint and rain for the disease and frost models
+    if: github.event.schedule == '35 2,8,14,20 * * *' || (github.event_name == 'workflow_dispatch' && inputs.source == 'era5-hourly')
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    concurrency:
+      group: climate-era5 # CDS rules: one request after the other (shared with the daily Europe job)
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Request missing hourly months
+        env:
+          CDS_API_KEY: ${{ secrets.CDS_API_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_CLIMATE_ACCESS_KEY_ID: ${{ secrets.R2_CLIMATE_ACCESS_KEY_ID }}
+          R2_CLIMATE_SECRET_ACCESS_KEY: ${{ secrets.R2_CLIMATE_SECRET_ACCESS_KEY }}
+        run: |
+          if [ -z "$R2_CLIMATE_ACCESS_KEY_ID" ] || [ -z "$CDS_API_KEY" ]; then echo "not set up yet: nothing to do"; exit 0; fi
+          python -m winemap_ingest.hourly era5 --minutes 150 ${{ inputs.years && format('--years {0}', inputs.years) || '' }}
+
+  stations:
+    if: github.event.schedule == '20 4 * * *' || (github.event_name == 'workflow_dispatch' && inputs.source == 'stations')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: climate-stations
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: KNMI hourly station observations
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_CLIMATE_ACCESS_KEY_ID: ${{ secrets.R2_CLIMATE_ACCESS_KEY_ID }}
+          R2_CLIMATE_SECRET_ACCESS_KEY: ${{ secrets.R2_CLIMATE_SECRET_ACCESS_KEY }}
+        run: |
+          if [ -z "$R2_CLIMATE_ACCESS_KEY_ID" ]; then echo "not set up yet: nothing to do"; exit 0; fi
+          python -m winemap_ingest.hourly stations ${{ inputs.years && format('--years {0}', inputs.years) || '' }}
