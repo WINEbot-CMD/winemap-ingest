@@ -3,7 +3,8 @@ Access with a service token), is the data fresh, do the jobs run? The result goe
 /status page shows it) and a message goes to ntfy only when something changes: a problem starts or is solved.
 
     python -m winemap_ingest.health
-env: CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET (Access service token), NTFY_TOPIC, KNMI_API_KEY, R2_*
+env: CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET (Access service token), NTFY_TOPIC, KNMI_API_KEY, R2_*,
+SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY (the accounts database: public values, the data is protected by its policies)
 """
 
 from __future__ import annotations
@@ -50,6 +51,28 @@ def check_site(url: str, headers: dict[str, str]) -> dict:
             body = r.read()
             ok = r.status == 200 and b"Winemap" in body and b"cloudflareaccess" not in body
             detail = "ok" if ok else f"HTTP {r.status}, not the Winemap page (Access login page?)"
+    except Exception as e:  # noqa: BLE001
+        ok, detail = False, str(e)[:160]
+    return {"ok": ok, "ms": round((time.monotonic() - t0) * 1000), "detail": detail}
+
+
+def check_supabase(url: str, key: str) -> dict:
+    """The accounts database (winemap-nl docs/25): sign-in answers and the database answers (its size, the one thing
+    the public key may read). Every 5 minutes, which also keeps a free project from pausing after 7 quiet days."""
+    t0 = time.monotonic()
+    base = url.rstrip("/")
+    try:
+        req = urllib.request.Request(f"{base}/auth/v1/health", headers={"apikey": key, "User-Agent": "winemap-health"})
+        urllib.request.urlopen(req, timeout=20).close()
+        req = urllib.request.Request(
+            f"{base}/rest/v1/rpc/status_db_size",
+            data=b"{}",
+            headers={"apikey": key, "Content-Type": "application/json", "User-Agent": "winemap-health"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            size = int(json.loads(r.read()))
+        ok, detail = True, f"ok, database {size / 1024**2:.0f} MB"
     except Exception as e:  # noqa: BLE001
         ok, detail = False, str(e)[:160]
     return {"ok": ok, "ms": round((time.monotonic() - t0) * 1000), "detail": detail}
@@ -139,6 +162,9 @@ def problems(state: dict, now: datetime) -> dict[str, str]:
             out[f"site:{name}"] = f"Winemap {name} is down: {s['detail']}"
         elif s.get("nowcast") and not s["nowcast"]["ok"]:
             out[f"wx:{name}"] = f"Live 2 h on {name} cannot read the nowcast: {s['nowcast']['detail']}"
+    sb = state.get("supabase")
+    if sb and not sb["ok"]:
+        out["supabase"] = f"The accounts database (Supabase) does not answer: {sb['detail']}"
     nc = _parse(state["data"].get("nowcast"))
     if nc and now - nc > NOWCAST_LATE:
         out["nowcast"] = f"Nowcast is {round((now - nc).total_seconds() / 60)} min old"
@@ -170,7 +196,15 @@ def notify(topic: str, title: str, message: str, priority: str = "default", tags
 
 
 def run(
-    store, now: datetime | None = None, sites=None, quota=None, jobs=None, plan=None, send=notify, log=print
+    store,
+    now: datetime | None = None,
+    sites=None,
+    quota=None,
+    jobs=None,
+    plan=None,
+    supabase=None,
+    send=notify,
+    log=print,
 ) -> dict:
     now = now or datetime.now(UTC)
     old = json.loads(store.get(STATE) or b"{}")
@@ -199,6 +233,12 @@ def run(
         "jobs_failing": jobs if jobs is not None else failing_jobs(),
         "plan": plan if plan is not None else plan_use(headers),
     }
+    if supabase is None and os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_PUBLISHABLE_KEY"):
+        supabase = check_supabase(os.environ["SUPABASE_URL"], os.environ["SUPABASE_PUBLISHABLE_KEY"])
+    if supabase:
+        prev = old.get("supabase")
+        supabase["since"] = prev["since"] if prev and prev.get("ok") == supabase["ok"] else _iso(now)
+        state["supabase"] = supabase
     now_p = problems(state, now)
     was = old.get("problems", {})
     topic = os.environ.get("NTFY_TOPIC", "")

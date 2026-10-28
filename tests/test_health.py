@@ -55,3 +55,31 @@ def test_alerts_only_when_a_problem_starts_or_ends(tmp_path):
 def test_free_plan_alert_from_80_percent():
     st = {"sites": {}, "data": {}, "jobs_failing": {}, "plan": {"r2ClassA": 0.81, "workers": 0.2}}
     assert health.problems(st, NOW) == {"plan:r2ClassA": "Free plan: r2ClassA at 81 %"}
+
+
+def test_supabase_down_is_a_problem_until_it_answers_again(tmp_path):
+    store = LocalStore(tmp_path)
+    store.put("rain/nowcast/index.json", json.dumps({"run": "2026-10-25T15:55:00Z"}).encode())
+    store.put("rain/index.json", json.dumps({"hour": {"last": "2026-10-25T14"}}).encode())
+    sent = []
+
+    def run(t, ok):
+        sb = {"ok": ok, "ms": 80, "detail": "ok, database 12 MB" if ok else "HTTP Error 503"}
+        return health.run(
+            store,
+            now=t,
+            sites=up(),
+            quota={"remaining": 500, "limit": 1000},
+            jobs={},
+            plan={},
+            supabase=sb,
+            send=lambda topic, title, msg, *a: sent.append((title, msg)),
+            log=lambda *_: None,
+        )
+
+    run(NOW, True)
+    s = run(NOW + timedelta(minutes=5), False)
+    assert "supabase" in s["problems"] and s["supabase"]["since"] == "2026-10-25T16:05:00Z"
+    assert sent[-1][0] == "Winemap: problem" and "Supabase" in sent[-1][1]
+    run(NOW + timedelta(minutes=10), True)
+    assert sent[-1][0] == "Winemap: solved"
