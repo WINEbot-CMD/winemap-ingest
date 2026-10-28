@@ -10,6 +10,8 @@ every 5 minutes, after the nowcast:
 
 A message goes out only when a warning starts (and, for the nowcast, after 15 dry minutes it can start again), so a
 long frosty spell or a rainy afternoon gives one message, not one every 5 minutes. State: `alerts/state.json`.
+Every message sent is also kept in `alerts/history.json` (place id, kind, time, text; two years), so the vineyard
+timeline in Analytics can show the warnings (winemap-nl docs/26).
 
     python -m winemap_ingest.alerts
 """
@@ -32,6 +34,8 @@ from .store import open_store
 
 PLACES = "alerts/places-live.json"
 STATE = "alerts/state.json"
+HISTORY = "alerts/history.json"
+HISTORY_DAYS = 730
 RAIN_MM = 0.5  # in the next 2 hours
 RAIN_SOON = timedelta(hours=1)
 HEAVY_MM = 20.0  # in the next 24 hours
@@ -184,6 +188,13 @@ def run(
     state = json.loads(store.get(STATE) or b"{}")
     active: dict = state.setdefault("active", {})
     topic = os.environ.get("NTFY_TOPIC", "")
+    sent: list[dict] = []  # the messages of this run, for the history
+
+    def record(p: dict, kind: str, title: str, text: str) -> None:
+        sent.append(
+            {"id": p["id"], "kind": kind, "at": now.isoformat(timespec="seconds"), "title": title, "text": text}
+        )
+
     if not places:
         log("no places yet")
         return state
@@ -206,13 +217,9 @@ def run(
             if key not in active:
                 mins = max(0, round((start - now).total_seconds() / 60))
                 when = "nu" if mins <= 5 else f"over {mins} min"
-                send(
-                    topic,
-                    f"Regen bij {p['name']}",
-                    f"Regen {when}: {total:.1f} mm in de komende 2 uur.",
-                    "default",
-                    "umbrella",
-                )
+                title, text = f"Regen bij {p['name']}", f"Regen {when}: {total:.1f} mm in de komende 2 uur."
+                send(topic, title, text, "default", "umbrella")
+                record(p, "rain", title, text)
             active[key] = {"since": active.get(key, {}).get("since", now.isoformat()), "dry": 0}
         elif key in active:
             active[key]["dry"] = active[key].get("dry", 0) + 1
@@ -228,17 +235,24 @@ def run(
             except Exception as e:  # noqa: BLE001
                 log(f"{p['name']}: forecast failed ({e})")
             else:
-                _forecast_alerts(p, low, high, rain24, now, active, topic, send)
-        _spray_alerts(places, sums if sums is not None else RainSums(store), now, active, topic, send)
+                _forecast_alerts(p, low, high, rain24, now, active, topic, send, record)
+        _spray_alerts(places, sums if sums is not None else RainSums(store), now, active, topic, send, record)
         state["hourly"] = now.isoformat()
 
     state["checked"] = now.isoformat()
     store.put(STATE, json.dumps(state, indent=1).encode(), "application/json")
+    if sent:
+        keep_from = (now - timedelta(days=HISTORY_DAYS)).isoformat()
+        old = json.loads(store.get(HISTORY) or b"{}").get("alerts", [])
+        alerts = [a for a in old if a.get("at", "") >= keep_from] + sent
+        store.put(HISTORY, json.dumps({"alerts": alerts}, separators=(",", ":")).encode(), "application/json")
     log(f"{len(places)} places; active: {sorted(active)}")
     return state
 
 
-def _forecast_alerts(p: dict, low: Extreme, high: Extreme, rain24, now: datetime, active: dict, topic, send) -> None:
+def _forecast_alerts(
+    p: dict, low: Extreme, high: Extreme, rain24, now: datetime, active: dict, topic, send, record=lambda *a: None
+) -> None:
     frost_c = _num(p.get("frostC"), FROST_C)
     heat_c = _num(p.get("heatC"), HEAT_C)
     severe_c = _num(p.get("heatSevereC"), HEAT_SEVERE_C)
@@ -271,10 +285,11 @@ def _forecast_alerts(p: dict, low: Extreme, high: Extreme, rain24, now: datetime
                 text = f"{rain24:.0f} mm verwacht in de komende 24 uur."
                 prio, tags = "default", "cloud_with_rain"
             send(topic, title, text, prio, tags)
+            record(p, kind, title, text)
         active[key] = {"since": active.get(key, {}).get("since", now.isoformat()), "level": max(level, before)}
 
 
-def _spray_alerts(places: list, sums, now: datetime, active: dict, topic, send) -> None:
+def _spray_alerts(places: list, sums, now: datetime, active: dict, topic, send, record=lambda *a: None) -> None:
     """Jasper: "spray again?" once per spray, when the rain since it passes its wash-off limit."""
     current = set()
     for p in places:
@@ -292,13 +307,10 @@ def _spray_alerts(places: list, sums, now: datetime, active: dict, topic, send) 
             mm = sums.since(day, c)
             if mm is None or mm < limit:
                 continue
-            send(
-                topic,
-                f"Opnieuw spuiten? {p['name']}",
-                f"{mm:.0f} mm regen sinds je bespuiting op {_day(day)} (afspoelgrens {limit:g} mm).",
-                "default",
-                "droplet",
-            )
+            title = f"Opnieuw spuiten? {p['name']}"
+            text = f"{mm:.0f} mm regen sinds je bespuiting op {_day(day)} (afspoelgrens {limit:g} mm)."
+            send(topic, title, text, "default", "droplet")
+            record(p, "spray", title, text)
             active[key] = {"since": now.isoformat(), "mm": round(mm, 1)}
     for key in [k for k in active if ":spray:" in k and k not in current]:  # the spray left the list (old, deleted)
         del active[key]

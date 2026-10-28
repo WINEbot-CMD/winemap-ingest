@@ -130,3 +130,24 @@ def test_rain_since_a_day_from_the_running_totals_and_hours(tmp_path):
     store.put(rain.hkey(date(2026, 10, 25)), rain.cog(tail))
     mm = alerts.RainSums(store).since(date(2026, 10, 20), (10, 10))
     assert mm == 12.0 + 1.5 + 2.0
+
+
+def test_messages_are_kept_in_the_history(tmp_path):
+    store, sent, send = setup(tmp_path)
+    cold = lambda x, y, now: ((-1.4, NOW + timedelta(hours=18)), (8.0, NOW), 25.0)  # noqa: E731
+    alerts.run(store, now=NOW, rain_field=field(None), forecast=cold, send=send, log=lambda *_: None)
+    h = json.loads(store.get(alerts.HISTORY))["alerts"]
+    assert sorted(a["kind"] for a in h) == ["frost", "heavy"]
+    assert all(a["id"] == "p1" and a["at"].startswith("2026-10-26") for a in h)
+    # nothing new: the history stays as it is; very old entries drop out when new ones come
+    alerts.run(
+        store, now=NOW + timedelta(hours=2), rain_field=field(None), forecast=cold, send=send, log=lambda *_: None
+    )
+    assert len(json.loads(store.get(alerts.HISTORY))["alerts"]) == 2
+    old = {"id": "p1", "kind": "rain", "at": "2020-01-01T00:00:00+00:00", "title": "x", "text": "y"}
+    store.put(alerts.HISTORY, json.dumps({"alerts": [old, *h]}).encode())
+    alerts.run(
+        store, now=NOW + timedelta(minutes=5), rain_field=field(0), forecast=cold, send=send, log=lambda *_: None
+    )
+    kinds = [a["kind"] for a in json.loads(store.get(alerts.HISTORY))["alerts"]]
+    assert "rain" in kinds and len(kinds) == 3  # the 2020 entry is gone, the new rain warning is in
