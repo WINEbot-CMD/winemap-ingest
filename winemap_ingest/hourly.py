@@ -29,7 +29,7 @@ from pathlib import Path
 import netCDF4
 import numpy as np
 
-from .climate import CDS_URL, FILL, SCALE, climate_store, to_int16
+from .climate import CDS_URL, ERA5_FIRST_YEAR, FILL, SCALE, climate_store, era5_requests, key_of, to_int16
 
 FIRST_YEAR = 2000
 MONTHS = range(4, 11)  # April - October: the growing season
@@ -129,8 +129,27 @@ def era5_pack(var: str, raw: bytes) -> bytes:
         return path.read_bytes()
 
 
-def run_era5(store, minutes: float, years=None, log=print) -> int:
+def europe_missing(store, today: date | None = None) -> int:
+    """How many month files of the daily Europe download (climate.py) are still missing. Jasper (28 Oct 2026):
+    Europe first - the hourly download shares the CDS queue and waits until Europe is complete."""
+    today = today or date.today()
+    last = date(today.year, today.month, 1) - timedelta(days=1)
+    have = set(store.list("climate/era5land/eu/"))
+    want = {
+        key_of("era5land", var, y, m)
+        for y in range(ERA5_FIRST_YEAR, last.year + 1)
+        for m in range(1, 13)
+        if date(y, m, 1) <= last
+        for var, _, _ in era5_requests(y, m)
+    }
+    return len(want - have)
+
+
+def run_era5(store, minutes: float, years=None, log=print, wait_for_europe=True) -> int:
     """Request the missing months one after the other (CDS: sequential), newest first."""
+    if wait_for_europe and (n := europe_missing(store)):
+        log(f"waiting: the daily Europe download comes first ({n} month files to go)")
+        return 0
     import cdsapi
 
     client = cdsapi.Client(url=CDS_URL, key=os.environ["CDS_API_KEY"], quiet=True, progress=False)
@@ -247,11 +266,15 @@ def main(argv: list[str] | None = None) -> None:
     e = sub.add_parser("era5")
     e.add_argument("--minutes", type=float, default=150)
     e.add_argument("--years", type=int, nargs=2, metavar=("NEWEST", "OLDEST"))
+    e.add_argument("--now", action="store_true", help="do not wait for the Europe download")
     s = sub.add_parser("stations")
     s.add_argument("--years", type=int, nargs=2, metavar=("NEWEST", "OLDEST"))
     a = ap.parse_args(argv)
     store = climate_store()
-    n = run_era5(store, a.minutes, a.years) if a.cmd == "era5" else run_stations(store, a.years)
+    if a.cmd == "era5":
+        n = run_era5(store, a.minutes, a.years, wait_for_europe=not a.now)
+    else:
+        n = run_stations(store, a.years)
     print(f"{n} files written to {store}")
 
 

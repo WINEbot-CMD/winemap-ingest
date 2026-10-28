@@ -46,3 +46,10 @@ def test_era5_rain_per_hour():
 def test_era5_months_newest_first_season_only():
     got = list(hourly.months_newest_first(2023, date(2024, 6, 30), None))
     assert got[:3] == [(2024, 6), (2024, 5), (2024, 4)] and got[3] == (2023, 10) and (2023, 3) not in got
+
+
+def test_hourly_waits_for_europe(tmp_path):
+    store = LocalStore(tmp_path)
+    logs = []
+    assert hourly.europe_missing(store, today=date(1961, 3, 15)) == 8  # Jan + Feb 1961, four files each
+    assert hourly.run_era5(store, 1, log=logs.append) == 0 and "Europe" in logs[0]
