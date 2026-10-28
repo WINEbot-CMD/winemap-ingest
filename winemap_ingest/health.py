@@ -28,6 +28,8 @@ STATUS = "https://winemap-nl.wopferu.workers.dev/api/status"  # live: it has the
 QUOTA_ALERT = 0.8
 INGEST_RUNS = "https://api.github.com/repos/WINEbot-CMD/winemap-ingest/actions/runs?per_page=30"
 NOWCAST_LATE = timedelta(minutes=45)
+# the two daily backups (winemap-nl docs/30): the laptop's and the nightly cloud one, each watched on its own
+BACKUP_LATE = {"laptop": timedelta(days=3), "cloud": timedelta(days=2)}
 RAIN_LATE = timedelta(hours=12)  # the hourly job catches up slowly while the KNMI limit is shared
 
 
@@ -100,6 +102,35 @@ def check_nowcast_path(site: str, headers: dict[str, str]) -> dict:
         return {"ok": False, "detail": str(e)[:160], "age_min": None}
 
 
+def check_backup(account: str, key_id: str, secret: str, client=None) -> dict:
+    """The newest daily backup of the laptop (winemap-YYYY-...) and of the cloud job (winemap-cloud-...) in the
+    private bucket `winemap-backup`, with a read-only key (winemap-nl docs/30)."""
+    try:
+        if client is None:
+            import boto3
+
+            client = boto3.client(
+                "s3",
+                endpoint_url=f"https://{account}.r2.cloudflarestorage.com",
+                aws_access_key_id=key_id,
+                aws_secret_access_key=secret,
+                region_name="auto",
+            )
+        newest: dict[str, dict] = {}
+        for page in client.get_paginator("list_objects_v2").paginate(Bucket="winemap-backup", Prefix="daily/"):
+            for o in page.get("Contents", []):
+                kind = "cloud" if o["Key"].startswith("daily/winemap-cloud-") else "laptop"
+                if kind not in newest or o["LastModified"] > newest[kind]["LastModified"]:
+                    newest[kind] = o
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "detail": f"cannot list the backups: {type(e).__name__}"}
+    out: dict = {"ok": True}
+    for kind in BACKUP_LATE:
+        o = newest.get(kind)
+        out[kind] = {"last": _iso(o["LastModified"]), "gb": round(o["Size"] / 1e9, 2)} if o else {"last": None}
+    return out
+
+
 def knmi_quota(key: str) -> dict | None:
     if not key:
         return None
@@ -165,6 +196,16 @@ def problems(state: dict, now: datetime) -> dict[str, str]:
     sb = state.get("supabase")
     if sb and not sb["ok"]:
         out["supabase"] = f"The accounts database (Supabase) does not answer: {sb['detail']}"
+    bk = state.get("backup")
+    if bk and not bk["ok"]:
+        out["backup"] = f"Backup check failed: {bk['detail']}"
+    elif bk:
+        for kind, late in BACKUP_LATE.items():
+            last = _parse((bk.get(kind) or {}).get("last"))
+            if last is None or now - last > late:
+                age = f"{(now - last).days} days old" if last else "missing"
+                why = "is the laptop off or its task broken?" if kind == "laptop" else "see the Cloud backup job"
+                out[f"backup:{kind}"] = f"The newest {kind} backup in R2 is {age} - {why} (docs/30)"
     nc = _parse(state["data"].get("nowcast"))
     if nc and now - nc > NOWCAST_LATE:
         out["nowcast"] = f"Nowcast is {round((now - nc).total_seconds() / 60)} min old"
@@ -203,6 +244,7 @@ def run(
     jobs=None,
     plan=None,
     supabase=None,
+    backup=None,
     send=notify,
     log=print,
 ) -> dict:
@@ -239,6 +281,14 @@ def run(
         prev = old.get("supabase")
         supabase["since"] = prev["since"] if prev and prev.get("ok") == supabase["ok"] else _iso(now)
         state["supabase"] = supabase
+    if backup is None and os.environ.get("BACKUP_R2_ACCESS_KEY_ID"):
+        backup = check_backup(
+            os.environ["R2_ACCOUNT_ID"],
+            os.environ["BACKUP_R2_ACCESS_KEY_ID"],
+            os.environ["BACKUP_R2_SECRET_ACCESS_KEY"],
+        )
+    if backup:
+        state["backup"] = backup
     now_p = problems(state, now)
     was = old.get("problems", {})
     topic = os.environ.get("NTFY_TOPIC", "")

@@ -83,3 +83,42 @@ def test_supabase_down_is_a_problem_until_it_answers_again(tmp_path):
     assert sent[-1][0] == "Winemap: problem" and "Supabase" in sent[-1][1]
     run(NOW + timedelta(minutes=10), True)
     assert sent[-1][0] == "Winemap: solved"
+
+
+def test_each_backup_is_watched_on_its_own():
+    st = {"sites": {}, "data": {}, "jobs_failing": {}, "plan": {}}
+    fresh = {"ok": True, "laptop": {"last": "2026-10-24T12:00:00Z"}, "cloud": {"last": "2026-10-25T02:40:00Z"}}
+    assert health.problems({**st, "backup": fresh}, NOW) == {}
+    laptop_off = {**fresh, "laptop": {"last": "2026-10-20T12:00:00Z"}}
+    got = health.problems({**st, "backup": laptop_off}, NOW)
+    assert list(got) == ["backup:laptop"] and "5 days old" in got["backup:laptop"]
+    no_cloud = {**fresh, "cloud": {"last": None}}
+    assert "missing" in health.problems({**st, "backup": no_cloud}, NOW)["backup:cloud"]
+    assert "failed" in health.problems({**st, "backup": {"ok": False, "detail": "x"}}, NOW)["backup"]
+    assert health.problems(st, NOW) == {}  # not configured: no alarm
+
+
+def test_check_backup_finds_the_newest_of_each():
+    from datetime import UTC, datetime
+
+    def obj(key, day, gb):
+        return {"Key": key, "LastModified": datetime(2026, 10, day, 13, tzinfo=UTC), "Size": gb * 1e9}
+
+    class Pages:
+        def paginate(self, **kw):
+            assert kw == {"Bucket": "winemap-backup", "Prefix": "daily/"}
+            yield {
+                "Contents": [
+                    obj("daily/winemap-2026-10-26.7z", 26, 2.3),
+                    obj("daily/winemap-2026-10-27.7z", 27, 0.1),
+                    obj("daily/winemap-cloud-2026-10-27.7z", 27, 1.5),
+                ]
+            }
+
+    class Client:
+        def get_paginator(self, name):
+            return Pages()
+
+    got = health.check_backup("acc", "id", "secret", client=Client())
+    assert got["ok"] and got["laptop"]["last"].startswith("2026-10-27T13") and got["laptop"]["gb"] == 0.1
+    assert got["cloud"]["gb"] == 1.5
