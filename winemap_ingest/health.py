@@ -28,6 +28,7 @@ STATUS = "https://winemap-nl.wopferu.workers.dev/api/status"  # live: it has the
 QUOTA_ALERT = 0.8
 INGEST_RUNS = "https://api.github.com/repos/WINEbot-CMD/winemap-ingest/actions/runs?per_page=30"
 NOWCAST_LATE = timedelta(minutes=45)
+BACKUP_LATE = timedelta(days=3)  # the laptop's daily backup (winemap-nl docs/30): also when the laptop is off
 RAIN_LATE = timedelta(hours=12)  # the hourly job catches up slowly while the KNMI limit is shared
 
 
@@ -100,6 +101,31 @@ def check_nowcast_path(site: str, headers: dict[str, str]) -> dict:
         return {"ok": False, "detail": str(e)[:160], "age_min": None}
 
 
+def check_backup(account: str, key_id: str, secret: str, client=None) -> dict:
+    """The newest daily backup in the private bucket `winemap-backup`, with a read-only key (winemap-nl docs/30)."""
+    try:
+        if client is None:
+            import boto3
+
+            client = boto3.client(
+                "s3",
+                endpoint_url=f"https://{account}.r2.cloudflarestorage.com",
+                aws_access_key_id=key_id,
+                aws_secret_access_key=secret,
+                region_name="auto",
+            )
+        newest = None
+        for page in client.get_paginator("list_objects_v2").paginate(Bucket="winemap-backup", Prefix="daily/"):
+            for o in page.get("Contents", []):
+                if newest is None or o["LastModified"] > newest["LastModified"]:
+                    newest = o
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "detail": f"cannot list the backups: {type(e).__name__}"}
+    if newest is None:
+        return {"ok": True, "last": None}
+    return {"ok": True, "last": _iso(newest["LastModified"]), "gb": round(newest["Size"] / 1e9, 2)}
+
+
 def knmi_quota(key: str) -> dict | None:
     if not key:
         return None
@@ -165,6 +191,14 @@ def problems(state: dict, now: datetime) -> dict[str, str]:
     sb = state.get("supabase")
     if sb and not sb["ok"]:
         out["supabase"] = f"The accounts database (Supabase) does not answer: {sb['detail']}"
+    bk = state.get("backup")
+    if bk:
+        last = _parse(bk.get("last"))
+        if not bk["ok"]:
+            out["backup"] = f"Backup check failed: {bk['detail']}"
+        elif last is None or now - last > BACKUP_LATE:
+            age = f"{(now - last).days} days old" if last else "missing"
+            out["backup"] = f"The newest backup in R2 is {age} - is the laptop off or the task broken? (docs/30)"
     nc = _parse(state["data"].get("nowcast"))
     if nc and now - nc > NOWCAST_LATE:
         out["nowcast"] = f"Nowcast is {round((now - nc).total_seconds() / 60)} min old"
@@ -203,6 +237,7 @@ def run(
     jobs=None,
     plan=None,
     supabase=None,
+    backup=None,
     send=notify,
     log=print,
 ) -> dict:
@@ -239,6 +274,14 @@ def run(
         prev = old.get("supabase")
         supabase["since"] = prev["since"] if prev and prev.get("ok") == supabase["ok"] else _iso(now)
         state["supabase"] = supabase
+    if backup is None and os.environ.get("BACKUP_R2_ACCESS_KEY_ID"):
+        backup = check_backup(
+            os.environ["R2_ACCOUNT_ID"],
+            os.environ["BACKUP_R2_ACCESS_KEY_ID"],
+            os.environ["BACKUP_R2_SECRET_ACCESS_KEY"],
+        )
+    if backup:
+        state["backup"] = backup
     now_p = problems(state, now)
     was = old.get("problems", {})
     topic = os.environ.get("NTFY_TOPIC", "")

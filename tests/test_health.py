@@ -83,3 +83,43 @@ def test_supabase_down_is_a_problem_until_it_answers_again(tmp_path):
     assert sent[-1][0] == "Winemap: problem" and "Supabase" in sent[-1][1]
     run(NOW + timedelta(minutes=10), True)
     assert sent[-1][0] == "Winemap: solved"
+
+
+def test_a_backup_older_than_three_days_or_missing_is_a_problem():
+    st = {"sites": {}, "data": {}, "jobs_failing": {}, "plan": {}}
+    fresh = {**st, "backup": {"ok": True, "last": "2026-10-24T12:00:00Z"}}
+    assert health.problems(fresh, NOW) == {}
+    old = {**st, "backup": {"ok": True, "last": "2026-10-20T12:00:00Z"}}
+    assert "5 days old" in health.problems(old, NOW)["backup"]
+    assert "missing" in health.problems({**st, "backup": {"ok": True, "last": None}}, NOW)["backup"]
+    assert "failed" in health.problems({**st, "backup": {"ok": False, "detail": "x"}}, NOW)["backup"]
+    assert health.problems(st, NOW) == {}  # not configured: no alarm
+
+
+def test_check_backup_finds_the_newest_daily():
+    from datetime import UTC, datetime
+
+    class Pages:
+        def paginate(self, **kw):
+            assert kw == {"Bucket": "winemap-backup", "Prefix": "daily/"}
+            yield {
+                "Contents": [
+                    {
+                        "Key": "daily/winemap-2026-10-26.7z",
+                        "LastModified": datetime(2026, 10, 26, 13, tzinfo=UTC),
+                        "Size": 2.3e9,
+                    },
+                    {
+                        "Key": "daily/winemap-2026-10-27.7z",
+                        "LastModified": datetime(2026, 10, 27, 13, tzinfo=UTC),
+                        "Size": 2.4e9,
+                    },
+                ]
+            }
+
+    class Client:
+        def get_paginator(self, name):
+            return Pages()
+
+    got = health.check_backup("acc", "id", "secret", client=Client())
+    assert got["ok"] and got["last"].startswith("2026-10-27T13") and got["gb"] == 2.4
