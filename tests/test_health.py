@@ -168,3 +168,25 @@ def test_keepalive_staging_database_and_powersync_once_a_day(tmp_path):
         "powersync": {"ok": True, "last_ok": "2026-10-21T16:00:00Z"},
     }
     assert list(health.problems(st, NOW)) == ["powersync"]
+
+
+def test_keepalive_for_the_live_powersync_too(tmp_path):
+    """Both instances are kept awake and watched on their own (winemap-nl docs/39)."""
+    store = LocalStore(tmp_path)
+    store.put("rain/nowcast/index.json", json.dumps({"run": "2026-10-25T15:55:00Z"}).encode())
+    store.put("rain/index.json", json.dumps({"hour": {"last": "2026-10-25T14"}}).encode())
+    s = health.run(
+        store,
+        now=NOW,
+        sites=up(),
+        quota={"remaining": 500, "limit": 1000},
+        jobs={},
+        plan={},
+        powersync={"ok": True, "ms": 900, "detail": "ok"},
+        powersync_live={"ok": False, "ms": 900, "detail": "HTTP Error 401"},
+        send=lambda *a: None,
+        log=lambda *_: None,
+    )
+    assert s["powersync"]["last_ok"] and s["powersync_live"]["last_ok"] is None
+    assert list(s["problems"]) == ["powersync_live"]
+    assert "(live)" in s["problems"]["powersync_live"]["message"]

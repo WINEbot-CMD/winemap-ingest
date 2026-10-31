@@ -7,6 +7,7 @@ env: CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET (Access service token), NTFY_
 SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY (the accounts database: public values, the data is protected by its policies),
 SUPABASE_STAGING_URL / SUPABASE_STAGING_PUBLISHABLE_KEY (the staging database, the same check),
 MONITOR_KEY (the key /api/status asks of this job),
+POWERSYNC_LIVE_URL + KEEPALIVE_LIVE_EMAIL / KEEPALIVE_LIVE_PASSWORD (the same for live, with SUPABASE_URL / KEY),
 POWERSYNC_URL + KEEPALIVE_EMAIL / KEEPALIVE_PASSWORD (a keep-alive account on that database: once a day it signs in and
 opens a PowerSync sync stream; the free PowerSync and Supabase plans stop a project after 1-2 weeks without use,
 winemap-nl docs/39)
@@ -41,6 +42,29 @@ RAIN_LATE = timedelta(hours=12)  # the hourly job catches up slowly while the KN
 # when it has not worked for this long, well before the instance would stop
 POWERSYNC_EVERY = timedelta(hours=20)
 POWERSYNC_LATE = timedelta(days=3)
+# the instances kept awake: state key -> (its name in messages, the env values check_powersync needs)
+POWERSYNC_TARGETS = {
+    "powersync": (
+        "staging",
+        (
+            "POWERSYNC_URL",
+            "SUPABASE_STAGING_URL",
+            "SUPABASE_STAGING_PUBLISHABLE_KEY",
+            "KEEPALIVE_EMAIL",
+            "KEEPALIVE_PASSWORD",
+        ),
+    ),
+    "powersync_live": (
+        "live",
+        (
+            "POWERSYNC_LIVE_URL",
+            "SUPABASE_URL",
+            "SUPABASE_PUBLISHABLE_KEY",
+            "KEEPALIVE_LIVE_EMAIL",
+            "KEEPALIVE_LIVE_PASSWORD",
+        ),
+    ),
+}
 
 
 def _iso(t: datetime) -> str:
@@ -249,13 +273,15 @@ def problems(state: dict, now: datetime) -> dict[str, str]:
     sbs = state.get("supabase_staging")
     if sbs and not sbs["ok"]:
         out["supabase_staging"] = f"The staging database (Supabase) does not answer - paused? {sbs['detail']}"
-    ps = state.get("powersync")
-    if ps:
+    for key, (name, _) in POWERSYNC_TARGETS.items():
+        ps = state.get(key)
+        if not ps:
+            continue
         last = _parse(ps.get("last_ok"))
         if not ps["ok"]:
-            out["powersync"] = f"PowerSync keep-alive failed: {ps['detail']}"
+            out[key] = f"PowerSync keep-alive ({name}) failed: {ps['detail']}"
         elif last is None or now - last > POWERSYNC_LATE:
-            out["powersync"] = "PowerSync keep-alive has not worked for 3 days - the free instance may stop (docs/39)"
+            out[key] = f"PowerSync keep-alive ({name}) has not worked for 3 days - the free instance may stop (docs/39)"
     bk = state.get("backup")
     if bk and not bk["ok"]:
         out["backup"] = f"Backup check failed: {bk['detail']}"
@@ -306,6 +332,7 @@ def run(
     supabase=None,
     supabase_staging=None,
     powersync=None,
+    powersync_live=None,
     backup=None,
     send=notify,
     log=print,
@@ -351,23 +378,20 @@ def run(
         prev = old.get("supabase_staging")
         supabase_staging["since"] = prev["since"] if prev and prev.get("ok") == supabase_staging["ok"] else _iso(now)
         state["supabase_staging"] = supabase_staging
-    prev_ps = old.get("powersync") or {}
-    due = (_parse(prev_ps.get("checked")) or datetime.min.replace(tzinfo=UTC)) <= now - POWERSYNC_EVERY
-    keys = (
-        "POWERSYNC_URL",
-        "SUPABASE_STAGING_URL",
-        "SUPABASE_STAGING_PUBLISHABLE_KEY",
-        "KEEPALIVE_EMAIL",
-        "KEEPALIVE_PASSWORD",
-    )
-    if powersync is None and due and all(env.get(k) for k in keys):
-        powersync = check_powersync(*(env[k] for k in keys))
-    if powersync:
-        powersync["checked"] = _iso(now)
-        powersync["last_ok"] = _iso(now) if powersync["ok"] else prev_ps.get("last_ok")
-        state["powersync"] = powersync
-    elif prev_ps:
-        state["powersync"] = prev_ps  # not due yet: keep the last result
+    for key, (_, keys), given in (
+        ("powersync", POWERSYNC_TARGETS["powersync"], powersync),
+        ("powersync_live", POWERSYNC_TARGETS["powersync_live"], powersync_live),
+    ):
+        prev_ps = old.get(key) or {}
+        due = (_parse(prev_ps.get("checked")) or datetime.min.replace(tzinfo=UTC)) <= now - POWERSYNC_EVERY
+        if given is None and due and all(env.get(k) for k in keys):
+            given = check_powersync(*(env[k] for k in keys))
+        if given:
+            given["checked"] = _iso(now)
+            given["last_ok"] = _iso(now) if given["ok"] else prev_ps.get("last_ok")
+            state[key] = given
+        elif prev_ps:
+            state[key] = prev_ps  # not due yet: keep the last result
     if backup is None and os.environ.get("BACKUP_R2_ACCESS_KEY_ID"):
         backup = check_backup(
             os.environ["R2_ACCOUNT_ID"],

@@ -55,6 +55,9 @@ jobs:
           POWERSYNC_URL: ${{ secrets.POWERSYNC_URL }}
           KEEPALIVE_EMAIL: ${{ secrets.KEEPALIVE_EMAIL }}
           KEEPALIVE_PASSWORD: ${{ secrets.KEEPALIVE_PASSWORD }}
+          POWERSYNC_LIVE_URL: ${{ secrets.POWERSYNC_LIVE_URL }}
+          KEEPALIVE_LIVE_EMAIL: ${{ secrets.KEEPALIVE_LIVE_EMAIL }}
+          KEEPALIVE_LIVE_PASSWORD: ${{ secrets.KEEPALIVE_LIVE_PASSWORD }}
           # read-only key of the private backup bucket (winemap-nl docs/30): warns when the laptop backup stops
           BACKUP_R2_ACCESS_KEY_ID: ${{ secrets.BACKUP_R2_ACCESS_KEY_ID }}
           BACKUP_R2_SECRET_ACCESS_KEY: ${{ secrets.BACKUP_R2_SECRET_ACCESS_KEY }}
