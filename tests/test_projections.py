@@ -5,57 +5,62 @@ from winemap_ingest import projections
 from winemap_ingest.store import LocalStore
 
 
-def global_file(path, var="tas"):
-    """Shaped like a CCKP climatology: (12, lat, lon), lon 0..360, value = month + lon/1000."""
-    lat = np.arange(-89.875, 90, 0.25)
-    lon = np.arange(0.125, 360, 0.25)
-    with netCDF4.Dataset(path, "w") as d:
-        d.createDimension("time", 12)
-        d.createDimension("lat", len(lat))
-        d.createDimension("lon", len(lon))
-        d.createVariable("lat", "f8", ("lat",))[:] = lat
-        d.createVariable("lon", "f8", ("lon",))[:] = lon
-        v = d.createVariable(f"climatology-{var}-monthly-mean", "f4", ("time", "lat", "lon"))
-        v[:] = np.arange(12)[:, None, None] + lon[None, None, :] / 1000
-        v.units = "degC"
+class FakeGrid:
+    """Like RemoteGrid: world 1-degree axes (lon -180..179), value = a per-variable constant + month / 100."""
+
+    VALUES = {"tasmax": 25.0, "tasmin": 13.0, "pr": 60.0, "hd35": 1.0, "tr": 2.0, "fd": 4.0}
+    opened: list[str] = []
+
+    def __init__(self, url):
+        self.var = next(v for v in self.VALUES if f"/{v}/" in url)
+        FakeGrid.opened.append(self.var)
+        self.lat = np.arange(-90.0, 91.0)
+        self.lon = np.arange(-180.0, 180.0)
+        self.n_time = 1032
+
+    def rows(self, t, r0, r1):
+        month = t % 12 + 1
+        return np.full((r1 - r0, len(self.lon)), self.VALUES[self.var] + (month - 1) * 0 + 0.0, dtype="f4")
 
 
-def test_europe_box_wraps_the_date_line_of_greenwich(tmp_path):
-    global_file(tmp_path / "g.nc")
-    with netCDF4.Dataset("e.nc", memory=projections.europe(tmp_path / "g.nc", "tas")) as d:
-        lon, lat, v = d["lon"][:], d["lat"][:], d["tas"]
-        assert lon[0] == -24.875 and lon[-1] == 44.875 and np.all(np.diff(lon) > 0)
-        assert lat[0] >= 34 and lat[-1] <= 72 and v.shape == (12, len(lat), len(lon))
-        assert v.units == "degC" and v.filters()["zlib"]
-        west = list(lon).index(-0.125)  # 359.875 at the source
-        assert abs(v[3, 0, west] - (3 + 0.359875)) < 1e-4 and abs(v[3, 0, west + 1] - (3 + 0.000125)) < 1e-4
+def test_window_wraps_greenwich_and_cuts_the_box():
+    lat = np.arange(-90.0, 90.25, 0.25)
+    for lon in (np.arange(-180, 180, 0.25), np.arange(0, 360, 0.25)):  # both conventions
+        r0, r1, cols, la, lo = projections.window(lat, lon, projections.REGIONS["eu"])
+        assert la[0] == 34 and la[-1] == 72 and r1 - r0 == len(la)
+        assert lo[0] == -25 and lo[-1] == 45 and np.all(np.diff(lo) > 0)
 
 
-def test_url_and_run_skip_what_is_there(tmp_path, monkeypatch):
-    assert projections.url("tas", "miroc6-r1i1p1f1", "ssp585", "2080-2099").endswith(
-        "tas/miroc6-r1i1p1f1-ssp585/climatology-tas-monthly-mean_cmip6-x0.25_miroc6-r1i1p1f1-ssp585"
-        "_climatology_mean_2080-2099.nc"
-    )
+def test_bcis_from_months():
+    shape = (2, 7, 3, 1)
+    v = {k: np.full(shape, x) for k, x in FakeGrid.VALUES.items()}
+    lat = np.array([38.0, 45.0, 52.0])
+    out = projections.bcis(v, lat)
+    # Tgem 19, Huglin per day (19 + 25) / 2 - 10 = 12; 214 days Apr-Oct, 183 Apr-Sep
+    assert np.allclose(out["EHI"][0, :, 0], 12 * 214 * np.array([1.02, 1.04, 1.06]))
+    assert np.allclose(out["HI"][0, :, 0], 12 * 183 * np.array([1.02, 1.04, 1.06]))
+    assert np.allclose(out["GST"], 19) and np.allclose(out["GSP"], 7 * 60)
+    assert np.allclose(out["EFD"], 0.5 * 4 + 4) and np.allclose(out["EHD"], 7) and np.allclose(out["TN"], 14)
+
+
+def test_run_writes_one_file_per_model_run_and_skips_done(tmp_path, monkeypatch):
     store = LocalStore(tmp_path / "store")
-    fetched = []
-
-    def fake(url, dest):
-        fetched.append(url)
-        global_file(dest)
-
-    monkeypatch.setattr(projections.urllib.request, "urlretrieve", fake)
-    monkeypatch.setattr(projections, "RUNS", [("ssp245", "2040-2059")])
-    monkeypatch.setattr(projections, "VARS", ["tas", "pr"])
-    store.put("climate/cckp/eu/m1/ssp245_2040-2059/tas.nc", b"x")
-    store.put("climate/cckp/world/m1/ssp245_2040-2059/tas.nc", b"x")
-    store.put("climate/cckp/world/m1/ssp245_2040-2059/pr.nc", b"x")  # only the Europe cut of pr is missing
+    store.put(projections.key("eu", "m1", "ssp245"), b"done")
     reported = []
     monkeypatch.setattr(projections, "report", lambda f, log=print: reported.append(f()))
-    assert projections.run(store, ["m1"], log=lambda *_: None) == 1
-    assert len(fetched) == 1 and "/pr/" in fetched[0]
-    assert store.get("climate/cckp/eu/m1/ssp245_2040-2059/pr.nc")[:3] == b"\x89HD"
-    assert store.get("climate/cckp/world/m1/ssp245_2040-2059/pr.nc") == b"x"  # not written again
+    monkeypatch.setattr(projections, "LAST_YEAR", 2016)
+    monkeypatch.setattr(projections, "MODELS", ["m1"])
+    FakeGrid.opened.clear()
+    assert projections.run(store, ["m1"], "eu", log=lambda *_: None, open_grid=FakeGrid) == 1
+    assert FakeGrid.opened == projections.VARS  # only ssp585 was read
+    raw = store.get(projections.key("eu", "m1", "ssp585"))
+    with netCDF4.Dataset("p.nc", memory=raw) as d:
+        assert list(d["year"][:]) == [2015, 2016]
+        assert d["GST"].dtype == np.int16 and d["GST"].filters()["zlib"]
+        assert np.allclose(d["GST"][:], 19) and np.allclose(d["GSP"][:], 420)
+        assert d["lat"][0] == 34 and d["lon"][0] == -25
+        assert "approximated" in d.EFD_note
     key, last = reported[-1]
-    assert key == "cckp" and last["files"] == last["total"] == 4 and last["manual"]
-    assert last["detail"] == "world 2 / 2 · Europe 2 / 2" and last["lastResult"] == "1 written"
-    assert reported[0][1]["lastResult"] == "running: 0 of 1 done" and reported[0][1]["files"] == 3
+    assert key == "cckp-eu" and last["files"] == last["total"] == 2
+    assert last["detail"] == "SSP245 1 / 1 · SSP585 1 / 1" and last["manual"]
+    assert reported[0][1]["lastResult"].startswith("running: m1 ssp585 tasmax (1/6)")

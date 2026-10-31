@@ -1,22 +1,24 @@
-"""Climate projections (Winemap docs/38, Jasper 31 Oct 2026): the World Bank's CMIP6 climatologies, world + Europe.
+"""Climate projections per year (Winemap docs/38, Jasper 31 Oct 2026): the World Bank's CMIP6 monthly time series.
 
-Source: Climate Change Knowledge Portal (CCKP), CMIP6 0.25 deg, bias-adjusted and downscaled, per model: the monthly
-mean of a 20-year period (s3://wbg-cckp, public; CC BY 4.0 - "The World Bank: CCKP, CMIP6 0.25 degree"). Ready-made
-period means, so ~6 GB for the world instead of ~590 GB of daily files (NEX-GDDP-CMIP6, chunks of the whole world per
-day). Jasper chose 8 models within the IPCC "likely" climate sensitivity (ECS 2.5-4 degC, TCR 1.4-2.2 degC) for the
-ensemble, and EC-Earth3 (the model behind KNMI'23, slightly warmer) on its own for comparison.
+Source: Climate Change Knowledge Portal (CCKP), CMIP6 0.25 deg, downscaled and bias-corrected to ERA5 (CC BY 4.0 -
+"The World Bank: CCKP, CMIP6 0.25 degree"), one 4.3 GB file per variable, model and scenario for the world, monthly
+2015-2100. Only the future (Jasper: the measured years come from ERA5); 2015-2025 are kept to check the hand-over to
+the measured years. Only the rows of the region and the season months are read (remote_nc.py), and only the BCIs per
+year are stored:
 
-    climate/cckp/world/<model>/<scenario>_<period>/<var>.nc   the source file as it is (whole world, lon 0..360)
-    climate/cckp/eu/<model>/<scenario>_<period>/<var>.nc      Europe cut, float32 (12 months, lat, lon), zlib, ~1.4 MB
+    projections/cckp/<region>/<model>/<scenario>.nc     int16 (year, lat, lon) per BCI, scaled, zlib
 
-Jasper kept the world too (for the wine belts later; ~6.2 GB, R2 a few cents a month above the free 10 GB).
-The status page shows the progress (monitor/climate.json "cckp", like the KNMI and ERA5 downloads).
+Models: 8 within the IPCC "likely" climate sensitivity (ECS 2.5-4 degC, TCR 1.4-2.2 degC) + EC-Earth3 (the model
+behind KNMI'23) for comparison; all 9 kept apart (Jasper). Scenarios SSP2-4.5 and SSP5-8.5. Region now Europe; the
+world follows (needs the Southern Hemisphere season).
 
-Variables: tas, tasmax, tasmin (degC), pr (mm per month), and the monthly counts tr (Tmin > 20 degC), hd35
-(Tmax > 35 degC), fd (Tmin < 0 degC) - enough for the season BCIs (winemap-compute projections step).
-Box: Europe as in the Europe view (lon -25..45, lat 34..72).
+BCIs from monthly values, the same definitions as winemap-compute bci.py (season 1 Apr - 31 Oct, Tgem = (Tmax +
+Tmin) / 2, Huglin k per latitude): Huglin per month = days x max(0, (Tgem + Tmax) / 2 - 10) x k (measured on ERA5:
+-0.9 % against daily values, docs/38); GST the day-weighted mean of Tgem; GSP the sum of the monthly rain; EHD and TN
+the monthly counts hd35 (Tmax > 35) and tr (Tmin > 20); EFD (15 Apr - 31 May) only approximated: half of April's
+frost days + May's.
 
-    python -m winemap_ingest.projections [--only <model>]       # in this repo's workflow, or with WX_STORE=<folder>
+    python -m winemap_ingest.projections [--model <id>] [--region eu]
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from __future__ import annotations
 import argparse
 import os
 import tempfile
-import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -32,6 +34,7 @@ import netCDF4
 import numpy as np
 
 from .climate import report
+from .remote_nc import RemoteGrid
 from .store import R2Store, open_store
 
 BASE = "https://wbg-cckp.s3.amazonaws.com/data/cmip6-x0.25"
@@ -46,108 +49,150 @@ ENSEMBLE = [
     "cmcc-esm2-r1i1p1f1",
 ]
 COMPARE = ["ec-earth3-r1i1p1f1"]
-RUNS = [("historical", "1995-2014")] + [(s, p) for s in ("ssp245", "ssp585") for p in ("2040-2059", "2080-2099")]
-VARS = ["tas", "tasmax", "tasmin", "pr", "tr", "hd35", "fd"]
-LON0, LAT0, LON1, LAT1 = -25.0, 34.0, 45.0, 72.0
-FILL = np.float32(1e20)
+MODELS = ENSEMBLE + COMPARE
+SCENARIOS = ["ssp245", "ssp585"]
+VARS = ["tasmax", "tasmin", "pr", "hd35", "tr", "fd"]
+FIRST_YEAR, LAST_YEAR = 2015, 2100
+# region -> (lon0, lat0, lon1, lat1); Europe as in the Europe view
+REGIONS = {"eu": (-25.0, 34.0, 45.0, 72.0)}
+MONTHS = [4, 5, 6, 7, 8, 9, 10]  # the season, April - October
+DAYS = np.array([30, 31, 30, 31, 31, 30, 31], dtype="f8")
+# id -> the scale for int16 (the scales of winemap-compute's curves)
+BCIS = {"EHI": 10, "HI": 10, "GST": 100, "GSP": 10, "EFD": 100, "EHD": 100, "TN": 100}
+FILL = np.int16(-32768)
 
 
-def url(var: str, model: str, scenario: str, period: str) -> str:
+def url(var: str, model: str, scenario: str) -> str:
     run = f"{model}-{scenario}"
-    return f"{BASE}/{var}/{run}/climatology-{var}-monthly-mean_cmip6-x0.25_{run}_climatology_mean_{period}.nc"
+    return f"{BASE}/{var}/{run}/timeseries-{var}-monthly-mean_cmip6-x0.25_{run}_timeseries_mean_{FIRST_YEAR}-2100.nc"
 
 
-def europe(src: Path, var: str) -> bytes:
-    """The Europe box of one global file (longitudes 0..360 there) as a small NetCDF, west to east."""
-    with netCDF4.Dataset(src) as d:
-        lat, lon = d["lat"][:], d["lon"][:]
-        name = next(k for k in d.variables if k.startswith("climatology-"))
-        lon180 = np.where(lon > 180, lon - 360, lon)
-        order = np.argsort(lon180)
-        lon_sorted = lon180[order]
-        cols = order[(lon_sorted >= LON0) & (lon_sorted <= LON1)]
-        rows = np.where((lat >= LAT0) & (lat <= LAT1))[0]
-        data = d[name][:, rows, :][:, :, cols].astype("float32")
-        units = getattr(d[name], "units", "")
-        out_lat, out_lon = lat[rows], lon180[cols]
+def key(region: str, model: str, scenario: str) -> str:
+    return f"projections/cckp/{region}/{model}/{scenario}.nc"
+
+
+def huglin_k(lat: np.ndarray) -> np.ndarray:
+    """winemap-compute bci.huglin_k: 1.02 below 42 degrees, +0.01 per 2 degrees, 1.06 from 48."""
+    steps = np.clip(np.floor((np.abs(np.asarray(lat, dtype=float)) - 40) / 2), 0, 4)
+    return 1.02 + 0.01 * steps
+
+
+def window(lat: np.ndarray, lon: np.ndarray, box) -> tuple[int, int, np.ndarray, np.ndarray, np.ndarray]:
+    """Rows r0..r1 and the columns (west to east; longitudes -180..180 or 0..360) of a box."""
+    lon0, lat0, lon1, lat1 = box
+    rows = np.where((lat >= lat0) & (lat <= lat1))[0]
+    lon180 = np.where(lon > 180, lon - 360, lon)
+    order = np.argsort(lon180, kind="stable")
+    cols = order[(lon180[order] >= lon0) & (lon180[order] <= lon1)]
+    return int(rows[0]), int(rows[-1]) + 1, cols, lat[rows], lon180[cols]
+
+
+def read_var(grid, box, threads: int = 16) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(years, months, lat, lon) float32 of one variable: the season months of every year, the box only."""
+    r0, r1, cols, lat, lon = window(grid.lat, grid.lon, box)
+    years = range(FIRST_YEAR, LAST_YEAR + 1)
+    months = [(y - FIRST_YEAR) * 12 + m - 1 for y in years for m in MONTHS]
+    with ThreadPoolExecutor(threads) as ex:
+        slabs = list(ex.map(lambda t: grid.rows(t, r0, r1)[:, cols], months))
+    return np.stack(slabs).reshape(len(years), len(MONTHS), r1 - r0, len(cols)), lat, lon
+
+
+def bcis(v: dict[str, np.ndarray], lat: np.ndarray) -> dict[str, np.ndarray]:
+    """The BCIs per year (year, lat, lon) from the season months (year, month, lat, lon)."""
+    tx, tn = v["tasmax"], v["tasmin"]
+    tg = (tx + tn) / 2
+    days = DAYS[None, :, None, None]
+    k = huglin_k(lat)[None, :, None]
+    hug = days * np.maximum(0.0, (tg + tx) / 2 - 10)
+    return {
+        "EHI": hug.sum(1) * k,
+        "HI": hug[:, :6].sum(1) * k,  # April - September
+        "GST": (tg * days).sum(1) / DAYS.sum(),
+        "GSP": v["pr"].sum(1),
+        "EFD": 0.5 * v["fd"][:, 0] + v["fd"][:, 1],
+        "EHD": v["hd35"].sum(1),
+        "TN": v["tr"].sum(1),
+    }
+
+
+def to_nc(out: dict[str, np.ndarray], lat: np.ndarray, lon: np.ndarray, model: str, scenario: str) -> bytes:
+    n_years = next(iter(out.values())).shape[0]
     with tempfile.TemporaryDirectory() as t:
-        path = Path(t) / "eu.nc"
+        path = Path(t) / "p.nc"
         with netCDF4.Dataset(path, "w") as o:
-            o.createDimension("month", 12)
-            o.createDimension("lat", len(out_lat))
-            o.createDimension("lon", len(out_lon))
-            o.createVariable("lat", "f8", ("lat",))[:] = out_lat
-            o.createVariable("lon", "f8", ("lon",))[:] = out_lon
-            v = o.createVariable(var, "f4", ("month", "lat", "lon"), zlib=True, complevel=6, fill_value=FILL)
-            v[:] = np.ma.filled(data, FILL)
-            v.units = units
-            o.source = "World Bank Climate Change Knowledge Portal (CCKP), CMIP6 0.25 degree; CC BY 4.0"
+            o.createDimension("year", n_years)
+            o.createDimension("lat", len(lat))
+            o.createDimension("lon", len(lon))
+            o.createVariable("year", "i2", ("year",))[:] = np.arange(FIRST_YEAR, FIRST_YEAR + n_years)
+            o.createVariable("lat", "f8", ("lat",))[:] = lat
+            o.createVariable("lon", "f8", ("lon",))[:] = lon
+            for name, scale in BCIS.items():
+                a = out[name] * scale
+                q = np.where(np.isfinite(a), np.clip(np.round(a), -32767, 32767), FILL).astype("i2")
+                v = o.createVariable(name, "i2", ("year", "lat", "lon"), zlib=True, complevel=6, fill_value=FILL)
+                v.set_auto_maskandscale(False)
+                v[:] = q
+                v.scale_factor = 1 / scale
+            o.EFD_note = "approximated from monthly frost-day counts: 0.5 x April + May"
+            o.model, o.scenario = model, scenario
+            o.source = "World Bank Climate Change Knowledge Portal (CCKP), CMIP6 0.25 degree time series; CC BY 4.0"
+            o.created = datetime.now(UTC).isoformat(timespec="seconds")
         return path.read_bytes()
 
 
-def keys(model: str, scenario: str, period: str, var: str) -> tuple[str, str]:
-    part = f"{model}/{scenario}_{period}/{var}.nc"
-    return f"climate/cckp/world/{part}", f"climate/cckp/eu/{part}"
-
-
-def progress(store, models: list[str], result: str) -> dict:
-    """For the status page: files in the bucket against all files of this download (world + Europe)."""
-    have = set(store.list("climate/cckp/"))
-    want = [k for m in models for s, p in RUNS for v in VARS for k in keys(m, s, p, v)]
-    world = sum(k in have for k in want if "/world/" in k)
-    eu = sum(k in have for k in want if "/eu/" in k)
+def progress(store, region: str, result: str) -> dict:
+    """For the status page: model runs (model x scenario) done against all."""
+    have = set(store.list(f"projections/cckp/{region}/"))
+    want = [key(region, m, s) for m in MODELS for s in SCENARIOS]
+    done = [k for k in want if k in have]
+    by = {s: sum(k.endswith(f"/{s}.nc") for k in done) for s in SCENARIOS}
     return {
         "org": "World Bank (CCKP)",
-        "title": f"CMIP6 projections 0.25°, {len(models)} models, world + Europe",
-        "files": world + eu,
+        "title": f"CMIP6 projections per year 2015–2100, 0.25°, {len(MODELS)} models ({region})",
+        "files": len(done),
         "total": len(want),
-        "unit": "files",
-        "detail": f"world {world} / {len(want) // 2} · Europe {eu} / {len(want) // 2}",
+        "unit": "model runs",
+        "detail": " · ".join(f"{s.upper()} {n} / {len(MODELS)}" for s, n in by.items()),
         "manual": True,  # started by hand: no 'stale' warning when it has not run for a day
         "lastRun": datetime.now(UTC).isoformat(timespec="seconds"),
         "lastResult": result,
     }
 
 
-def run(store, models: list[str], log=print, every: int = 10) -> int:
-    """Download what is missing (skips what is there); reports progress every `every` files."""
-    done = set(store.list("climate/cckp/"))
-    todo = [(m, s, p, v) for m in models for s, p in RUNS for v in VARS if not set(keys(m, s, p, v)) <= done]
-    n = 0
+def run(store, models: list[str], region: str = "eu", log=print, open_grid=RemoteGrid) -> int:
+    """Each missing model run: read the six variables, compute the BCIs, store one file. Returns the runs written."""
+    box = REGIONS[region]
+    have = set(store.list(f"projections/cckp/{region}/"))
 
     def status(result: str) -> None:
-        report(lambda: ("cckp", progress(store, models, result)), log=log)
+        report(lambda: (f"cckp-{region}", progress(store, region, result)), log=log)
 
-    status(f"running: 0 of {len(todo)} done")
-    for model, scenario, period, var in todo:
-        world, eu = keys(model, scenario, period, var)
-        with tempfile.TemporaryDirectory() as t:
-            src = Path(t) / "global.nc"
-            try:
-                urllib.request.urlretrieve(url(var, model, scenario, period), src)
-            except Exception as e:  # noqa: BLE001
-                log(f"missing at the source: {model} {scenario} {period} {var} ({e})")
+    n = 0
+    for model in models:
+        for scenario in SCENARIOS:
+            if key(region, model, scenario) in have:
                 continue
-            if world not in done:
-                store.put(world, src.read_bytes(), "application/x-netcdf")
-            if eu not in done:
-                store.put(eu, europe(src, var), "application/x-netcdf")
-        n += 1
-        log(eu)
-        if n % every == 0:
-            status(f"running: {n} of {len(todo)} done")
-    status(f"{n} written" if n == len(todo) else f"{n} of {len(todo)} written")
+            v = {}
+            for i, var in enumerate(VARS, 1):
+                status(f"running: {model.split('-r1')[0]} {scenario} {var} ({i}/{len(VARS)})")
+                v[var], lat, lon = read_var(open_grid(url(var, model, scenario)), box)
+                log(f"{model} {scenario} {var}: {v[var].shape}")
+            raw = to_nc(bcis(v, lat), lat, lon, model, scenario)
+            store.put(key(region, model, scenario), raw, "application/x-netcdf")
+            n += 1
+            log(f"written {key(region, model, scenario)}")
+    status(f"{n} model runs written")
     return n
 
 
 def main() -> None:
     a = argparse.ArgumentParser()
-    a.add_argument("--only", help="one model id (default: the ensemble and EC-Earth3)")
+    a.add_argument("--model", help="one model id (default: all 9)")
+    a.add_argument("--region", default="eu", choices=sorted(REGIONS))
     args = a.parse_args()
     where = os.environ.get("WX_STORE", "r2")  # a folder for a local try-out
     store = open_store(where) if where != "r2" else R2Store(bucket="winemap-climate", creds="R2_CLIMATE")
-    models = [args.only] if args.only else ENSEMBLE + COMPARE
-    print(f"{run(store, models)} files written")
+    print(f"{run(store, [args.model] if args.model else MODELS, args.region)} model runs written")
 
 
 if __name__ == "__main__":
