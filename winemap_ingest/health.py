@@ -4,7 +4,11 @@ Access with a service token), is the data fresh, do the jobs run? The result goe
 
     python -m winemap_ingest.health
 env: CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET (Access service token), NTFY_TOPIC, KNMI_API_KEY, R2_*,
-SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY (the accounts database: public values, the data is protected by its policies)
+SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY (the accounts database: public values, the data is protected by its policies),
+SUPABASE_STAGING_URL / SUPABASE_STAGING_PUBLISHABLE_KEY (the staging database, the same check),
+POWERSYNC_URL + KEEPALIVE_EMAIL / KEEPALIVE_PASSWORD (a keep-alive account on that database: once a day it signs in and
+opens a PowerSync sync stream; the free PowerSync and Supabase plans stop a project after 1-2 weeks without use,
+winemap-nl docs/39)
 """
 
 from __future__ import annotations
@@ -31,6 +35,10 @@ NOWCAST_LATE = timedelta(minutes=45)
 # the two daily backups (winemap-nl docs/30): the laptop's and the nightly cloud one, each watched on its own
 BACKUP_LATE = {"laptop": timedelta(days=3), "cloud": timedelta(days=2)}
 RAIN_LATE = timedelta(hours=12)  # the hourly job catches up slowly while the KNMI limit is shared
+# PowerSync keep-alive (winemap-nl docs/39): once a day is plenty (the free plan stops after 1-2 weeks); a warning
+# when it has not worked for this long, well before the instance would stop
+POWERSYNC_EVERY = timedelta(hours=20)
+POWERSYNC_LATE = timedelta(days=3)
 
 
 def _iso(t: datetime) -> str:
@@ -75,6 +83,41 @@ def check_supabase(url: str, key: str) -> dict:
         with urllib.request.urlopen(req, timeout=20) as r:
             size = int(json.loads(r.read()))
         ok, detail = True, f"ok, database {size / 1024**2:.0f} MB"
+    except Exception as e:  # noqa: BLE001
+        ok, detail = False, str(e)[:160]
+    return {"ok": ok, "ms": round((time.monotonic() - t0) * 1000), "detail": detail}
+
+
+def check_powersync(ps_url: str, sb_url: str, sb_key: str, email: str, password: str) -> dict:
+    """PowerSync keep-alive: sign in as the keep-alive account (staging database) and open a sync stream until its
+    first checkpoint - real use of the instance, so the free plan does not stop it."""
+    t0 = time.monotonic()
+    try:
+        req = urllib.request.Request(
+            f"{sb_url.rstrip('/')}/auth/v1/token?grant_type=password",
+            data=json.dumps({"email": email, "password": password}).encode(),
+            headers={"apikey": sb_key, "Content-Type": "application/json", "User-Agent": "winemap-health"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            token = json.loads(r.read())["access_token"]
+        req = urllib.request.Request(
+            f"{ps_url.rstrip('/')}/sync/stream",
+            data=json.dumps({"buckets": [], "include_checksum": True, "raw_data": True}).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Token {token}",
+                "User-Agent": "winemap-health",
+            },
+            method="POST",
+        )
+        got = False
+        with urllib.request.urlopen(req, timeout=30) as r:
+            for raw in r:  # the stream stays open: stop at the first checkpoint
+                if b"checkpoint" in raw:
+                    got = True
+                    break
+        ok, detail = got, "ok, synced" if got else "no checkpoint from PowerSync"
     except Exception as e:  # noqa: BLE001
         ok, detail = False, str(e)[:160]
     return {"ok": ok, "ms": round((time.monotonic() - t0) * 1000), "detail": detail}
@@ -196,6 +239,16 @@ def problems(state: dict, now: datetime) -> dict[str, str]:
     sb = state.get("supabase")
     if sb and not sb["ok"]:
         out["supabase"] = f"The accounts database (Supabase) does not answer: {sb['detail']}"
+    sbs = state.get("supabase_staging")
+    if sbs and not sbs["ok"]:
+        out["supabase_staging"] = f"The staging database (Supabase) does not answer - paused? {sbs['detail']}"
+    ps = state.get("powersync")
+    if ps:
+        last = _parse(ps.get("last_ok"))
+        if not ps["ok"]:
+            out["powersync"] = f"PowerSync keep-alive failed: {ps['detail']}"
+        elif last is None or now - last > POWERSYNC_LATE:
+            out["powersync"] = "PowerSync keep-alive has not worked for 3 days - the free instance may stop (docs/39)"
     bk = state.get("backup")
     if bk and not bk["ok"]:
         out["backup"] = f"Backup check failed: {bk['detail']}"
@@ -244,6 +297,8 @@ def run(
     jobs=None,
     plan=None,
     supabase=None,
+    supabase_staging=None,
+    powersync=None,
     backup=None,
     send=notify,
     log=print,
@@ -281,6 +336,31 @@ def run(
         prev = old.get("supabase")
         supabase["since"] = prev["since"] if prev and prev.get("ok") == supabase["ok"] else _iso(now)
         state["supabase"] = supabase
+    # keep-alive (winemap-nl docs/39): the staging database every run, PowerSync once a day
+    env = os.environ
+    if supabase_staging is None and env.get("SUPABASE_STAGING_URL") and env.get("SUPABASE_STAGING_PUBLISHABLE_KEY"):
+        supabase_staging = check_supabase(env["SUPABASE_STAGING_URL"], env["SUPABASE_STAGING_PUBLISHABLE_KEY"])
+    if supabase_staging:
+        prev = old.get("supabase_staging")
+        supabase_staging["since"] = prev["since"] if prev and prev.get("ok") == supabase_staging["ok"] else _iso(now)
+        state["supabase_staging"] = supabase_staging
+    prev_ps = old.get("powersync") or {}
+    due = (_parse(prev_ps.get("checked")) or datetime.min.replace(tzinfo=UTC)) <= now - POWERSYNC_EVERY
+    keys = (
+        "POWERSYNC_URL",
+        "SUPABASE_STAGING_URL",
+        "SUPABASE_STAGING_PUBLISHABLE_KEY",
+        "KEEPALIVE_EMAIL",
+        "KEEPALIVE_PASSWORD",
+    )
+    if powersync is None and due and all(env.get(k) for k in keys):
+        powersync = check_powersync(*(env[k] for k in keys))
+    if powersync:
+        powersync["checked"] = _iso(now)
+        powersync["last_ok"] = _iso(now) if powersync["ok"] else prev_ps.get("last_ok")
+        state["powersync"] = powersync
+    elif prev_ps:
+        state["powersync"] = prev_ps  # not due yet: keep the last result
     if backup is None and os.environ.get("BACKUP_R2_ACCESS_KEY_ID"):
         backup = check_backup(
             os.environ["R2_ACCOUNT_ID"],
