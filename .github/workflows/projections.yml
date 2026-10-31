@@ -1,0 +1,50 @@
+# Climate projections per year (Winemap docs/38, Jasper 31 Oct 2026): the World Bank CCKP CMIP6 monthly time series
+# (0.25 deg, 2015-2100, CC BY 4.0) for 8 models + EC-Earth3, SSP2-4.5 and SSP5-8.5. Only the rows of the region and
+# the season months are read (~3 GB per model run instead of 26 GB), and only the BCIs per year are stored:
+# winemap-climate projections/cckp/<region>/<model>/<scenario>.nc. One job per model, side by side (public repo:
+# free minutes). By hand only: the source does not change; a rerun skips what is already there. Progress on the
+# status page (Downloads, "World Bank (CCKP)").
+name: Climate projections
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "eu (the world follows later)"
+        default: "eu"
+
+permissions:
+  contents: read
+
+jobs:
+  cckp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false # one model failing must not stop the others; a rerun fills the gaps
+      matrix:
+        model:
+          - mpi-esm1-2-hr-r1i1p1f1
+          - mri-esm2-0-r1i1p1f1
+          - gfdl-esm4-r1i1p1f1
+          - miroc6-r1i1p1f1
+          - noresm2-lm-r1i1p1f1
+          - bcc-csm2-mr-r1i1p1f1
+          - access-esm1-5-r1i1p1f1
+          - cmcc-esm2-r1i1p1f1
+          - ec-earth3-r1i1p1f1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Read the model run and compute the BCIs per year
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_CLIMATE_ACCESS_KEY_ID: ${{ secrets.R2_CLIMATE_ACCESS_KEY_ID }}
+          R2_CLIMATE_SECRET_ACCESS_KEY: ${{ secrets.R2_CLIMATE_SECRET_ACCESS_KEY }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }} # for monitor/climate.json in winemap-wx (status page)
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python -m winemap_ingest.projections --model ${{ matrix.model }} --region ${{ inputs.region }}
