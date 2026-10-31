@@ -1,0 +1,39 @@
+# Maps of the climate projections for the viewer (Winemap docs/38, Jasper 31 Oct 2026): per scenario, method (the
+# measured level + the models' change, or the projections as they are) and model (the 8-model mean, EC-Earth3), the
+# BCIs per year 2026-2100 on the ERA5-Land grid -> winemap-wx bci/cckp/eu/ (~3.5 GB, Jasper: fine). By hand, after
+# "Climate projections"; one job per scenario.
+name: Projection maps
+
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Optional: one BCI (EHI, HI, GST, GSP, EFD, EHD, TN); default all"
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  maps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [ssp245, ssp585]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Compute and write the maps
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_CLIMATE_ACCESS_KEY_ID: ${{ secrets.R2_CLIMATE_ACCESS_KEY_ID }}
+          R2_CLIMATE_SECRET_ACCESS_KEY: ${{ secrets.R2_CLIMATE_SECRET_ACCESS_KEY }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python -m winemap_ingest.projection_maps --scenario ${{ matrix.scenario }} ${{ inputs.only && format('--only {0}', inputs.only) || '' }}
