@@ -1,7 +1,7 @@
-# Climate projections for Europe (Winemap docs/38, Jasper 31 Oct 2026): the World Bank CCKP CMIP6 climatologies
-# (0.25 deg, monthly means of 20-year periods, CC BY 4.0) for 8 models + EC-Earth3, SSP2-4.5 and SSP5-8.5,
-# cut to Europe -> winemap-climate climate/cckp/eu/. By hand only: the source does not change; a rerun skips
-# what is already there (~400 files, ~0.6 GB).
+# Climate projections (Winemap docs/38, Jasper 31 Oct 2026): the World Bank CCKP CMIP6 climatologies
+# (0.25 deg, monthly means of 20-year periods, CC BY 4.0) for 8 models + EC-Earth3, SSP2-4.5 and SSP5-8.5
+# -> winemap-climate climate/cckp/world/ (as downloaded, ~6.2 GB) and climate/cckp/eu/ (cut, ~0.45 GB).
+# By hand only: the source does not change; a rerun skips what is already there. Progress on the status page.
 name: Climate projections
 
 on:
@@ -28,9 +28,11 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Download and cut to Europe
+      - name: Download (world) and cut to Europe
         env:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_CLIMATE_ACCESS_KEY_ID: ${{ secrets.R2_CLIMATE_ACCESS_KEY_ID }}
           R2_CLIMATE_SECRET_ACCESS_KEY: ${{ secrets.R2_CLIMATE_SECRET_ACCESS_KEY }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }} # for monitor/climate.json in winemap-wx (status page)
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: python -m winemap_ingest.projections ${{ inputs.model && format('--only {0}', inputs.model) || '' }}

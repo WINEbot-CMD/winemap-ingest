@@ -47,6 +47,15 @@ def test_url_and_run_skip_what_is_there(tmp_path, monkeypatch):
     monkeypatch.setattr(projections, "RUNS", [("ssp245", "2040-2059")])
     monkeypatch.setattr(projections, "VARS", ["tas", "pr"])
     store.put("climate/cckp/eu/m1/ssp245_2040-2059/tas.nc", b"x")
-    assert projections.run(store, ["m1"]) == 1
+    store.put("climate/cckp/world/m1/ssp245_2040-2059/tas.nc", b"x")
+    store.put("climate/cckp/world/m1/ssp245_2040-2059/pr.nc", b"x")  # only the Europe cut of pr is missing
+    reported = []
+    monkeypatch.setattr(projections, "report", lambda f, log=print: reported.append(f()))
+    assert projections.run(store, ["m1"], log=lambda *_: None) == 1
     assert len(fetched) == 1 and "/pr/" in fetched[0]
     assert store.get("climate/cckp/eu/m1/ssp245_2040-2059/pr.nc")[:3] == b"\x89HD"
+    assert store.get("climate/cckp/world/m1/ssp245_2040-2059/pr.nc") == b"x"  # not written again
+    key, last = reported[-1]
+    assert key == "cckp" and last["files"] == last["total"] == 4 and last["manual"]
+    assert last["detail"] == "world 2 / 2 · Europe 2 / 2" and last["lastResult"] == "1 written"
+    assert reported[0][1]["lastResult"] == "running: 0 of 1 done" and reported[0][1]["files"] == 3

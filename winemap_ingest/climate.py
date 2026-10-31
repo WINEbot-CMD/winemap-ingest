@@ -25,6 +25,7 @@ import json
 import os
 import tempfile
 import time
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -365,16 +366,19 @@ def progress(store, source: str, result: str, today: date | None = None) -> dict
     }
 
 
-def report(source: str, store, result: str, log=print) -> None:
-    """monitor/climate.json in winemap-wx (read by /api/status). Never fails the run."""
+def report(source: str | Callable[[], tuple[str, dict]], store=None, result: str = "", log=print) -> None:
+    """monitor/climate.json in winemap-wx (read by /api/status). Never fails the run.
+
+    `source` is "knmi"/"era5land", or for other downloads (projections.py) a function giving (key, entry)."""
     try:
         from .store import R2Store
 
         if os.environ.get("CLIMATE_STORE", "r2") != "r2" or not os.environ.get("R2_ACCESS_KEY_ID"):
             return
+        key, entry = source() if callable(source) else (source, progress(store, source, result))
         wx = R2Store(bucket="winemap-wx")
         state = json.loads(wx.get("monitor/climate.json") or b"{}")
-        state[source] = progress(store, source, result)
+        state[key] = entry
         state["updated"] = datetime.now(UTC).isoformat(timespec="seconds")
         wx.put("monitor/climate.json", json.dumps(state, indent=1).encode(), "application/json")
     except Exception as e:  # noqa: BLE001
