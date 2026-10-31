@@ -10,6 +10,10 @@ on:
       only:
         description: "Optional: one BCI (EHI, HI, GST, GSP, EFD, EHD, TN); default all"
         default: ""
+      spread_only:
+        description: "Only the models' spread per year (series_p10 / p90), not the maps"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -36,4 +40,4 @@ jobs:
           R2_CLIMATE_SECRET_ACCESS_KEY: ${{ secrets.R2_CLIMATE_SECRET_ACCESS_KEY }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: python -m winemap_ingest.projection_maps --scenario ${{ matrix.scenario }} ${{ inputs.only && format('--only {0}', inputs.only) || '' }}
+        run: python -m winemap_ingest.projection_maps --scenario ${{ matrix.scenario }} ${{ inputs.only && format('--only {0}', inputs.only) || '' }} ${{ inputs.spread_only && '--spread-only' || '' }}

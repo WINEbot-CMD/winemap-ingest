@@ -6,6 +6,8 @@ Out: bci/cckp/eu/<scenario>/<method>/<model>/   (winemap-wx, /wx/ on the site), 
          <BCI>/<year>.tif      the year's value, float32 COG on the ERA5-Land grid (0.1 degrees), NaN = sea
          <BCI>/cum/<year>.tif  running sums from 2025, for the mean of any period
          <BCI>/series.tif      every year as a band (the series at a point)
+         <BCI>/series_p10.tif, series_p90.tif   (ensemble only) the 10th / 90th percentile of the 8 models per
+                               year: the band of the outlook chart (Jasper, 31 Oct 2026)
          index.json            years, ranges, region means
 
 Only the years from 2026 (Jasper: "no years before 2026 for the projections, so it is clear they are projections").
@@ -15,7 +17,7 @@ Two methods, to compare (Jasper: "do both"; docs/38 §8):
     raw    the projections as the models give them (0.25 degrees, drawn as blocks on the 0.1 degree grid).
 Models: "ensemble" = the mean of the 8 within the IPCC likely climate sensitivity; "ec-earth3" on its own.
 
-    python -m winemap_ingest.projection_maps [--scenario ssp245] [--only EHI]
+    python -m winemap_ingest.projection_maps [--scenario ssp245] [--only EHI] [--spread-only]
 """
 
 from __future__ import annotations
@@ -110,15 +112,16 @@ def delta(base_meas: np.ndarray, change: np.ndarray, bci: str) -> np.ndarray:
     return np.maximum(out, 0.0) if bci in COUNTS else out
 
 
-def maps_for(store_clim, store_wx, scenario: str, bci: str, log=print) -> dict[tuple[str, str], tuple]:
-    """(method, model) -> (years from 2026, lat, lon) on the measured grid."""
+def maps_for(store_clim, store_wx, scenario: str, bci: str, log=print) -> tuple[dict, dict]:
+    """(method, model) -> (years from 2026, lat, lon) on the measured grid; and per method the ensemble's spread
+    (p10, p90 of the models per year) on the same grid."""
     meas = [read_tif(store_wx.get(f"bci/era5land/eu/{bci}/{y}.tif")) for y in BASE]
     grid = meas[0][1]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         base_meas = np.nanmean([m[0] for m in meas], 0)
     land = np.isfinite(base_meas)
-    out = {}
+    out, spread = {}, {}
     for name, models in MODELS.items():
         runs = []
         for m in models:
@@ -140,8 +143,21 @@ def maps_for(store_clim, store_wx, scenario: str, bci: str, log=print) -> dict[t
         for method, v in (("delta", d), ("raw", r)):
             v = np.where(land[None], v, np.nan)
             out[(method, name)] = (np.round(v, DECIMALS.get(bci, 1)), grid)
+        if len(models) > 1:
+            # the band: the 10th and 90th percentile of the models each year (delta: of their change, added to the
+            # measured level as the mean is; raw: of their values)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                fut = stack[:, keep]
+                per = fut / np.where(base_model > 0, base_model, np.nan) if bci in RATIO else fut - base_model
+                for method, src, how in (("delta", per, Resampling.bilinear), ("raw", fut, Resampling.nearest)):
+                    lo, hi = (to_grid(np.nanpercentile(src, q, 0), lat, lon, grid, how) for q in (10, 90))
+                    if method == "delta":
+                        lo, hi = delta(base_meas, lo, bci), delta(base_meas, hi, bci)
+                    dec = DECIMALS.get(bci, 1)
+                    spread[method] = tuple(np.round(np.where(land[None], x, np.nan), dec) for x in (lo, hi))
         log(f"{scenario} {bci} {name}: {len(keep)} years")
-    return out
+    return out, spread
 
 
 def write(store_wx, scenario: str, method: str, model: str, bci: str, maps: np.ndarray, grid: Grid, years: list[int]):
@@ -169,17 +185,32 @@ def write(store_wx, scenario: str, method: str, model: str, bci: str, maps: np.n
         }
 
 
-def run(store_clim, store_wx, scenarios: list[str], bcis: list[str], log=print) -> int:
+def write_spread(store_wx, scenario: str, method: str, bci: str, lo: np.ndarray, hi: np.ndarray, grid: Grid, years):
+    """The band of the outlook chart: the models' 10th and 90th percentile per year, as series (one band a year)."""
+    base = f"bci/cckp/eu/{scenario}/{method}/ensemble/{bci}"
+    for name, a in (("series_p10", lo), ("series_p90", hi)):
+        raw = cog_bytes(a, grid, {"years": ",".join(map(str, years)), "percentile": name[-3:]}, len(years), series=True)
+        store_wx.put(f"{base}/{name}.tif", raw, "image/tiff")
+
+
+def run(store_clim, store_wx, scenarios: list[str], bcis: list[str], log=print, spread_only: bool = False) -> int:
     n = 0
     for scenario in scenarios:
         index = {(method, model): {} for method in METHODS for model in MODELS}
         grid = None
         for bci in bcis:
-            maps = maps_for(store_clim, store_wx, scenario, bci, log)
+            maps, spread = maps_for(store_clim, store_wx, scenario, bci, log)
+            for method, (lo, hi) in spread.items():
+                years = list(range(FIRST, FIRST + lo.shape[0]))
+                write_spread(store_wx, scenario, method, bci, lo, hi, maps[(method, "ensemble")][1], years)
+            if spread_only:
+                continue
             for (method, model), (v, grid) in maps.items():
                 years = list(range(FIRST, FIRST + v.shape[0]))
                 index[(method, model)][bci] = write(store_wx, scenario, method, model, bci, v, grid, years)
                 n += 1
+        if spread_only:
+            continue
         for (method, model), entries in index.items():
             doc = {
                 "version": 1,
@@ -214,13 +245,15 @@ def main() -> None:
     a = argparse.ArgumentParser()
     a.add_argument("--scenario", choices=SCENARIOS, help="one scenario (default: both)")
     a.add_argument("--only", choices=BCIS, help="one BCI (default: all)")
+    a.add_argument("--spread-only", action="store_true", help="only the models' spread (series_p10 / p90)")
     args = a.parse_args()
     where = os.environ.get("WX_STORE", "r2")  # a folder for a local try-out: both stores in it
     if where != "r2":
         clim = wx = open_store(where)
     else:
         clim, wx = R2Store(bucket="winemap-climate", creds="R2_CLIMATE"), R2Store(bucket="winemap-wx")
-    n = run(clim, wx, [args.scenario] if args.scenario else SCENARIOS, [args.only] if args.only else BCIS)
+    scenarios = [args.scenario] if args.scenario else SCENARIOS
+    n = run(clim, wx, scenarios, [args.only] if args.only else BCIS, spread_only=args.spread_only)
     print(f"{n} layers written")
 
 
