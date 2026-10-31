@@ -122,3 +122,49 @@ def test_check_backup_finds_the_newest_of_each():
     got = health.check_backup("acc", "id", "secret", client=Client())
     assert got["ok"] and got["laptop"]["last"].startswith("2026-10-27T13") and got["laptop"]["gb"] == 0.1
     assert got["cloud"]["gb"] == 1.5
+
+
+def test_keepalive_staging_database_and_powersync_once_a_day(tmp_path):
+    """winemap-nl docs/39: the free plans stop a project after 1-2 weeks without use."""
+    store = LocalStore(tmp_path)
+    store.put("rain/nowcast/index.json", json.dumps({"run": "2026-10-25T15:55:00Z"}).encode())
+    store.put("rain/index.json", json.dumps({"hour": {"last": "2026-10-25T14"}}).encode())
+    sent = []
+
+    def run(t, **checks):
+        return health.run(
+            store,
+            now=t,
+            sites=up(),
+            quota={"remaining": 500, "limit": 1000},
+            jobs={},
+            plan={},
+            send=lambda topic, title, msg, *a: sent.append((title, msg)),
+            log=lambda *_: None,
+            **checks,
+        )
+
+    s = run(
+        NOW, supabase_staging={"ok": True, "ms": 70, "detail": "ok"}, powersync={"ok": True, "ms": 900, "detail": "ok"}
+    )
+    assert s["powersync"]["last_ok"] == "2026-10-25T16:00:00Z" and s["problems"] == {}
+    # not due again within the day: the last result stays
+    s = run(NOW + timedelta(hours=1), supabase_staging={"ok": True, "ms": 70, "detail": "ok"})
+    assert s["powersync"]["last_ok"] == "2026-10-25T16:00:00Z"
+    # a paused staging database and a failing keep-alive are problems
+    s = run(
+        NOW + timedelta(days=1),
+        supabase_staging={"ok": False, "ms": 70, "detail": "HTTP Error 540"},
+        powersync={"ok": False, "ms": 900, "detail": "HTTP Error 401"},
+    )
+    assert {"supabase_staging", "powersync"} <= set(s["problems"])  # (the test data is a day old by now too)
+    assert s["powersync"]["last_ok"] == "2026-10-25T16:00:00Z"  # the last time it worked stays known
+    # even when the check itself has nothing new to say, 3 days without success is a problem
+    st = {
+        "sites": {},
+        "data": {},
+        "jobs_failing": {},
+        "plan": {},
+        "powersync": {"ok": True, "last_ok": "2026-10-21T16:00:00Z"},
+    }
+    assert list(health.problems(st, NOW)) == ["powersync"]
