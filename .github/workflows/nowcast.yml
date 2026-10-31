@@ -46,6 +46,7 @@ jobs:
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          MONITOR_KEY: ${{ secrets.MONITOR_KEY }}  # /api/status of the site (winemap-nl worker/auth.js)
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
           # keep-alive of the free plans (winemap-nl docs/39): the staging database, and once a day a PowerSync sync
