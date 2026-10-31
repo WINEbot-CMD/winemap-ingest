@@ -1,0 +1,36 @@
+# Climate projections for Europe (Winemap docs/38, Jasper 31 Oct 2026): the World Bank CCKP CMIP6 climatologies
+# (0.25 deg, monthly means of 20-year periods, CC BY 4.0) for 8 models + EC-Earth3, SSP2-4.5 and SSP5-8.5,
+# cut to Europe -> winemap-climate climate/cckp/eu/. By hand only: the source does not change; a rerun skips
+# what is already there (~400 files, ~0.6 GB).
+name: Climate projections
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Optional: one model id, e.g. mpi-esm1-2-hr-r1i1p1f1 (default: all 9)"
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  cckp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: climate-projections
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Download and cut to Europe
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_CLIMATE_ACCESS_KEY_ID: ${{ secrets.R2_CLIMATE_ACCESS_KEY_ID }}
+          R2_CLIMATE_SECRET_ACCESS_KEY: ${{ secrets.R2_CLIMATE_SECRET_ACCESS_KEY }}
+        run: python -m winemap_ingest.projections ${{ inputs.model && format('--only {0}', inputs.model) || '' }}
