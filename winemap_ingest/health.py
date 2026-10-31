@@ -6,6 +6,7 @@ Access with a service token), is the data fresh, do the jobs run? The result goe
 env: CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET (Access service token), NTFY_TOPIC, KNMI_API_KEY, R2_*,
 SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY (the accounts database: public values, the data is protected by its policies),
 SUPABASE_STAGING_URL / SUPABASE_STAGING_PUBLISHABLE_KEY (the staging database, the same check),
+MONITOR_KEY (the key /api/status asks of this job),
 POWERSYNC_URL + KEEPALIVE_EMAIL / KEEPALIVE_PASSWORD (a keep-alive account on that database: once a day it signs in and
 opens a PowerSync sync stream; the free PowerSync and Supabase plans stop a project after 1-2 weeks without use,
 winemap-nl docs/39)
@@ -217,11 +218,16 @@ def failing_jobs() -> dict[str, int]:
 
 
 def plan_use(headers: dict[str, str]) -> dict:
-    """The free-plan meter from /api/status (Worker requests, R2, Analytics Engine): name -> share used (0..1)."""
-    if not headers:
+    """The free-plan meter from /api/status (Worker requests, R2, Analytics Engine): name -> share used (0..1).
+    /api/status has the site's own lock (winemap-nl worker/auth.js): this job shows the shared MONITOR_KEY; the
+    Access headers still pass Cloudflare Access while it guards live."""
+    key = os.environ.get("MONITOR_KEY", "")
+    if not headers and not key:
         return {}
     try:
-        req = urllib.request.Request(STATUS, headers={"User-Agent": "winemap-health", **headers})
+        req = urllib.request.Request(
+            STATUS, headers={"User-Agent": "winemap-health", **headers, **({"X-Monitor-Key": key} if key else {})}
+        )
         with urllib.request.urlopen(req, timeout=30) as r:
             q = json.loads(r.read()).get("quota") or {}
     except Exception:  # noqa: BLE001
