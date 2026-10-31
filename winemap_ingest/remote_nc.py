@@ -16,6 +16,7 @@ import io
 import struct
 import time
 import urllib.request
+import zlib
 
 import numpy as np
 
@@ -137,13 +138,17 @@ class RemoteGrid:
         d = f[name]
         pl = d.id.get_create_plist()
         filters = {pl.get_filter(i)[0] for i in range(pl.get_nfilters())}
-        if filters - {h5py.h5z.FILTER_SHUFFLE} or d.chunks not in (None, (1,) + d.shape[1:]):
-            raise ValueError(f"HDF5 layout not one plain month per chunk: {d.chunks} filters {filters}")
+        if filters - {h5py.h5z.FILTER_SHUFFLE, h5py.h5z.FILTER_DEFLATE} or d.chunks not in (None, (1,) + d.shape[1:]):
+            raise ValueError(f"HDF5 layout not one month per chunk: {d.chunks} filters {filters}")
         self._shuffle = h5py.h5z.FILTER_SHUFFLE in filters
+        # compressed (deflate): a month's whole chunk is fetched and unpacked, the rows can not be read on their own
+        self._deflate = h5py.h5z.FILTER_DEFLATE in filters
         self.n_time, n_lat, self.n_lon = d.shape
         self._n_elem = n_lat * self.n_lon
         chunk = d.id.get_chunk_info_by_coord
-        self._offsets = [chunk((t, 0, 0)).byte_offset for t in range(self.n_time)] if d.chunks else None
+        info = [chunk((t, 0, 0)) for t in range(self.n_time)] if d.chunks else None
+        self._offsets = [i.byte_offset for i in info] if info else None
+        self._sizes = [i.size for i in info] if info else None
         if self._offsets is None:
             self._begin, self._step = d.id.get_offset(), n_lat * self.n_lon * d.dtype.itemsize
         self._dtype, self._size = d.dtype.str, d.dtype.itemsize
@@ -154,7 +159,13 @@ class RemoteGrid:
     def rows(self, t: int, r0: int, r1: int) -> np.ndarray:
         """Rows r0..r1-1 of month t as float32; the fill value becomes NaN."""
         base = self._offsets[t] if getattr(self, "_offsets", None) else self._begin + t * self._step
-        if getattr(self, "_shuffle", False):
+        if getattr(self, "_deflate", False):
+            raw = zlib.decompress(fetch(self.url, base, base + self._sizes[t] - 1))
+            if self._shuffle:  # the bytes were grouped per position: k-th bytes of all values, then the next
+                raw = np.frombuffer(raw, "u1").reshape(self._size, self._n_elem).T.tobytes()
+            row = self.n_lon * self._size
+            raw = raw[r0 * row : r1 * row]
+        elif getattr(self, "_shuffle", False):
             # byte k of value e sits at k * (values in the chunk) + e
             e0, e1 = r0 * self.n_lon, r1 * self.n_lon
             starts = [base + k * self._n_elem for k in range(self._size)]
