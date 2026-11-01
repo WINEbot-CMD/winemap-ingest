@@ -13,6 +13,7 @@ last day of the previous month up to the second-last day of its month; the BCI s
 Runs (GitHub Actions in this repo, or on the laptop with a folder as the store):
     python -m winemap_ingest.climate knmi [--years 2024 1961] [--minutes 50]
     python -m winemap_ingest.climate era5 [--years 2025 1961] [--minutes 320]
+    python -m winemap_ingest.climate era5-world [--years 2025 1991] [--minutes 320] [--parallel 3]   # wine belts
     python -m winemap_ingest.climate pack-knmi <raw dir> <year> [<year> ...]     # the laptop's KNMI files
     python -m winemap_ingest.climate pack-era5 <raw dir> <year> [<year> ...]     # the laptop's ERA5 files
 Each run picks up what is missing in the store, newest first, until its time or the request limit is used up.
@@ -44,6 +45,16 @@ KNMI_FIRST_YEAR = 1961
 ERA5_FIRST_YEAR = 1961
 ERA5_AREA = [72.0, -25.0, 27.0, 45.0]  # all of Europe, as pipeline/download_era5land.py (north, west, south, east)
 ERA5_STATS = {"tg": "daily_mean", "tn": "daily_minimum", "tx": "daily_maximum"}
+# The world's wine belts outside Europe's box, with a wide margin (Jasper, 1 Nov 2026: wine belts first, the rest of the
+# world later; 1991-2025, newest first), [north, west, south, east]:
+WORLD_AREAS = {
+    "na": [62.0, -170.0, 20.0, -50.0],  # North America (Okanagan 50 N .. Baja California, Mexico)
+    "as": [62.0, 45.0, 20.0, 150.0],  # Asia east of Europe's box: Central Asia, China, Japan, India from 20 N
+    "sa": [-8.0, -82.0, -56.0, -34.0],  # South America (Brazil's São Francisco valley 9 S .. Patagonia)
+    "saf": [-8.0, 10.0, -36.0, 42.0],  # southern Africa
+    "oc": [-8.0, 110.0, -48.0, 180.0],  # Australia and New Zealand
+}
+WORLD_FIRST_YEAR = 1991
 CDS_URL = "https://cds.climate.copernicus.eu/api"
 
 
@@ -206,9 +217,9 @@ def days_in(store, key: str) -> int:
 # ---------------------------------------------------------------- ERA5-Land
 
 
-def era5_requests(year: int, month: int):
+def era5_requests(year: int, month: int, area: list[float] = ERA5_AREA):
     """(var, dataset, request) for one month: three temperature statistics and the rain."""
-    base = {"year": str(year), "month": [f"{month:02d}"], "day": [f"{d:02d}" for d in range(1, 32)], "area": ERA5_AREA}
+    base = {"year": str(year), "month": [f"{month:02d}"], "day": [f"{d:02d}" for d in range(1, 32)], "area": area}
     for var, stat in ERA5_STATS.items():
         yield (
             var,
@@ -297,6 +308,66 @@ def run_era5(store, minutes: float, years=None, log=print) -> int:
     return done
 
 
+def world_key(region: str, var: str, year: int, month: int) -> str:
+    return f"climate/era5land/{region}/{var}/{year}/{year}-{month:02d}.nc"
+
+
+def run_era5_world(store, minutes: float, years=None, parallel: int = 3, log=print) -> int:
+    """The world's wine belts (WORLD_AREAS), newest month first, a few requests at a time (Jasper: in parallel to
+    Europe's own job); each request with its own CDS client. Stops after 5 failures; the next run goes on."""
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    import cdsapi
+
+    stop = time.monotonic() + minutes * 60
+    have = set()
+    for region in WORLD_AREAS:
+        have |= set(store.list(f"climate/era5land/{region}/"))
+    today = date.today()
+    last = date(today.year, today.month, 1) - timedelta(days=1)
+    todo = [
+        (world_key(region, var, year, month), dataset, request)
+        for year, month in months_newest_first(WORLD_FIRST_YEAR, last, years)
+        for region, area in WORLD_AREAS.items()
+        for var, dataset, request in era5_requests(year, month, area)
+    ]
+    todo = [t for t in todo if t[0] not in have]
+    log(f"{len(todo)} world month files to go")
+
+    def fetch(job) -> str:
+        key, dataset, request = job
+        client = cdsapi.Client(url=CDS_URL, key=os.environ["CDS_API_KEY"], quiet=True, progress=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            part = Path(tmp) / "cds.nc"
+            client.retrieve(dataset, request).download(str(part))
+            var = key.split("/")[3]
+            store.put(key, era5_pack(var, part.read_bytes()), "application/x-netcdf")
+        return key
+
+    done = failed = 0
+    jobs = iter(todo)
+    with ThreadPoolExecutor(parallel) as ex:
+        running = {}
+        while True:
+            while len(running) < parallel and time.monotonic() < stop and failed < 5:
+                job = next(jobs, None)
+                if job is None:
+                    break
+                running[ex.submit(fetch, job)] = job[0]
+            if not running:
+                return done
+            finished, _ = wait(running, return_when=FIRST_COMPLETED)
+            for f in finished:
+                key = running.pop(f)
+                try:
+                    f.result()
+                    done += 1
+                    log(f"ok {key}")
+                except Exception as e:  # noqa: BLE001
+                    failed += 1
+                    log(f"FAILED {key}: {e}")
+
+
 # ---------------------------------------------------------------- the laptop's downloads
 
 
@@ -343,6 +414,7 @@ def pack_local_era5(store, raw_dir: Path, years: list[int], log=print) -> int:
 SOURCES = {
     "knmi": ("KNMI", "Daily grids NL, 1 km (tg, tn, tx, rr)", KNMI_FIRST_YEAR),
     "era5land": ("Copernicus (ECMWF)", "ERA5-Land Europe, 0.1° (tg, tn, tx, rr)", ERA5_FIRST_YEAR),
+    "era5land-world": ("Copernicus (ECMWF)", "ERA5-Land world wine belts, 0.1° (tg, tn, tx, rr)", WORLD_FIRST_YEAR),
 }
 
 
@@ -350,10 +422,15 @@ def progress(store, source: str, result: str, today: date | None = None) -> dict
     """Months in the store against the months that exist (1961 to last month), for the status page."""
     today = today or date.today()
     org, title, first = SOURCES[source]
-    region = "nl" if source == "knmi" else "eu"
-    keys = store.list(f"climate/{source}/{region}/")
+    if source == "era5land-world":
+        keys = [k for r in WORLD_AREAS for k in store.list(f"climate/era5land/{r}/")]
+        per_month = len(VARS) * len(WORLD_AREAS)
+    else:
+        region = "nl" if source == "knmi" else "eu"
+        keys = store.list(f"climate/{source}/{region}/")
+        per_month = len(VARS)
     months = sorted({k.rsplit("/", 1)[-1][:7] for k in keys})
-    total = ((today.year - first) * 12 + today.month - 1) * len(VARS)  # up to and including last month
+    total = ((today.year - first) * 12 + today.month - 1) * per_month  # up to and including last month
     return {
         "org": org,
         "title": title,
@@ -402,6 +479,10 @@ def main(argv: list[str] | None = None) -> None:
         p = sub.add_parser(name)
         p.add_argument("--years", type=int, nargs=2, metavar=("NEWEST", "OLDEST"))
         p.add_argument("--minutes", type=float, default=default)
+    p = sub.add_parser("era5-world")
+    p.add_argument("--years", type=int, nargs=2, metavar=("NEWEST", "OLDEST"))
+    p.add_argument("--minutes", type=float, default=320)
+    p.add_argument("--parallel", type=int, default=3)
     for name in ("pack-knmi", "pack-era5"):
         p = sub.add_parser(name)
         p.add_argument("raw", type=Path)
@@ -415,6 +496,9 @@ def main(argv: list[str] | None = None) -> None:
     elif a.cmd == "era5":
         n = run_era5(store, a.minutes, a.years)
         report("era5land", store, f"{n} months written")
+    elif a.cmd == "era5-world":
+        n = run_era5_world(store, a.minutes, a.years, a.parallel)
+        report("era5land-world", store, f"{n} months written")
     elif a.cmd == "pack-knmi":
         n = pack_local_knmi(store, a.raw, a.years)
     else:

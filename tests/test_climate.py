@@ -136,3 +136,45 @@ def test_latest_version_per_day():
     b = "INTER_OPER_R___TX1_____L3__20180101T000000_20180102T000000_0006.nc"
     c = "INTER_OPER_R___TX1_____L3__20180102T000000_20180103T000000_0002.nc"
     assert climate.latest_per_day([b, c, a]) == [b, c]
+
+
+def test_world_download_newest_first_per_area_skips_done_and_stays_parallel(tmp_path, monkeypatch):
+    import sys
+    import threading
+    import types
+
+    from winemap_ingest import climate
+
+    store = LocalStore(tmp_path)
+    store.put(climate.world_key("oc", "tg", 2024, 12), b"done")  # already there
+    seen, live, peak = [], [0], [0]
+    lock = threading.Lock()
+
+    class Client:
+        def __init__(self, **kw):
+            pass
+
+        def retrieve(self, dataset, request):
+            with lock:
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+                seen.append((request["year"], request["month"][0], request["area"]))
+
+            class Result:
+                def download(self, path):
+                    open(path, "wb").write(b"nc")
+                    with lock:
+                        live[0] -= 1
+
+            return Result()
+
+    monkeypatch.setitem(sys.modules, "cdsapi", types.SimpleNamespace(Client=Client))
+    monkeypatch.setattr(climate, "era5_pack", lambda var, raw: b"packed")
+    monkeypatch.setenv("CDS_API_KEY", "x")
+    n = climate.run_era5_world(store, minutes=5, years=(2024, 2024), parallel=3, log=lambda *_: None)
+    per_month = len(climate.VARS) * len(climate.WORLD_AREAS)
+    assert n == 12 * per_month - 1  # one month file was there
+    assert seen[0][:2] == ("2024", "12")  # newest first
+    assert {tuple(a) for _, _, a in seen} == {tuple(a) for a in climate.WORLD_AREAS.values()}
+    assert peak[0] <= 3
+    assert store.get(climate.world_key("na", "rr", 2024, 1)) == b"packed"
