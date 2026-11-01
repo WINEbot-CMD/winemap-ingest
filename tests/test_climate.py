@@ -169,7 +169,9 @@ def test_world_download_a_year_per_request_split_into_months(tmp_path, monkeypat
     monkeypatch.setitem(sys.modules, "cdsapi", types.SimpleNamespace(Client=Client))
     monkeypatch.setattr(climate, "era5_pack_months", lambda var, raw: {(2024, m): b"packed" for m in range(1, 13)})
     monkeypatch.setenv("CDS_API_KEY", "x")
-    n = climate.run_era5_world(store, minutes=5, years=(2024, 2024), parallel=3, log=lambda *_: None)
+    n = climate.run_era5_world(
+        store, minutes=5, years=(2024, 2024), parallel=3, log=lambda *_: None, after_europe=False
+    )
     assert n == len(climate.VARS) * len(climate.WORLD_AREAS)  # one request per area and variable for the year
     assert {a for _, _, a in seen} == {tuple(a) for a in climate.WORLD_AREAS.values()}
     oc = climate.WORLD_AREAS["oc"]
@@ -188,3 +190,13 @@ def test_a_year_split_into_months_is_packed_as_months_asked_alone():
     t1, a1 = read(parts[(2026, 2)], "tx")
     t2, a2 = read(alone, "tx")
     assert t1 == t2 and np.allclose(a1, a2)
+
+
+def test_world_waits_until_europe_is_complete(tmp_path, monkeypatch):
+    store = LocalStore(tmp_path)
+    monkeypatch.setenv("CDS_API_KEY", "x")
+    assert not climate.europe_complete(store)
+    assert climate.run_era5_world(store, minutes=5, years=(2024, 2024), log=lambda *_: None) == 0  # no CDS call
+    for v in climate.VARS:
+        store.put(climate.key_of("era5land", v, climate.ERA5_FIRST_YEAR, 1), b"x")
+    assert climate.europe_complete(store)
