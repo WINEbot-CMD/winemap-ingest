@@ -10,6 +10,9 @@ many. Kept: the areas whose inside point lies in the country (the extracts reach
     regions/eu/municipalities.fgb    EPSG:3035, ~20 m simplified, spatial index (the viewer reads what is in view)
     regions/eu/municipalities.json   name search: [name, iso, lon, lat] per municipality
     regions/eu/municipalities_report.json   per country: level, count, expected, source date
+    regions/eu/borders_osm.fgb       the countries (level 2) and their provinces / regions (level 4) from the same
+                                     data, EPSG:3035, ~30 m: on the aerial photo every level lines up (Jasper, 1 Nov
+                                     2026: geoBoundaries, Natural Earth and OSM side by side did not)
 
 In the workflow one job per country (a whole run in one job ran out of memory at Germany, 1 Nov 2026) writes its part,
 then one job joins them:
@@ -38,6 +41,7 @@ PARTS = PREFIX + "municipalities/parts/"
 LEVELS = (6, 7, 8, 9)
 READ_SIMPLIFY_DEG = 0.00005  # ~5 m: kept finer than the final 20 m, but no full-detail rings held in memory
 SIMPLIFY_M = 20
+BORDERS_SIMPLIFY_M = 30  # countries and regions: drawn from country zoom on
 ATTRIBUTION = "© OpenStreetMap contributors (ODbL)"
 
 # ISO -> (Geofabrik name, about how many municipalities the country has)
@@ -137,6 +141,21 @@ def municipalities_of(iso: str, areas: list[dict]) -> tuple[list[dict], dict]:
     return chosen, {"level": level, "count": len(chosen), "expected": COUNTRIES[iso][1], "per_level": counts}
 
 
+def borders_of(iso: str, areas: list[dict]) -> list[dict]:
+    """The country's outline (level 2) and its provinces / regions (level 4), from the same extract as its
+    municipalities, so all share the same line pieces."""
+    from shapely import prepared
+
+    country = country_of(iso, areas)
+    if country is None:
+        return []
+    inside = prepared.prep(country)
+    regions = [
+        dict(a, iso=iso) for a in areas if a["level"] == 4 and inside.contains(a["geometry"].representative_point())
+    ]
+    return [{"id": f"c{iso}", "level": 2, "name": iso, "iso": iso, "geometry": country}, *regions]
+
+
 def download(name: str, to: Path, log=print) -> Path:
     import shutil
     import ssl
@@ -153,7 +172,7 @@ def download(name: str, to: Path, log=print) -> Path:
     return path
 
 
-def compact(features: list[dict]):
+def compact(features: list[dict], simplify_m: float = SIMPLIFY_M):
     """A country's municipalities as they are kept: EPSG:3035, ~20 m simplified, with their name point (lon / lat), so
     only the small result stays in memory while the next country is read."""
     import geopandas as gpd
@@ -166,7 +185,7 @@ def compact(features: list[dict]):
     pts = gdf.geometry.representative_point()
     gdf["lon"], gdf["lat"] = pts.x.round(4), pts.y.round(4)
     gdf = gdf.to_crs("EPSG:3035")
-    gdf["geometry"] = gdf.geometry.simplify(SIMPLIFY_M, preserve_topology=True).buffer(0)
+    gdf["geometry"] = gdf.geometry.simplify(simplify_m, preserve_topology=True).buffer(0)
     return gdf
 
 
@@ -187,12 +206,21 @@ def country_part(store, iso: str, log=print, fetch=download) -> dict:
         work = Path(t)
         pbf = fetch(COUNTRIES[iso][0], work, log=log)
         t0 = time.time()
-        chosen, line = municipalities_of(iso, boundaries(pbf))
+        areas = boundaries(pbf)
         pbf.unlink(missing_ok=True)
+        chosen, line = municipalities_of(iso, areas)
         if chosen:
             path = work / f"{iso}.fgb"
             compact(chosen).to_file(path, driver="FlatGeobuf")
             store.put(f"{PARTS}{iso}.fgb", path.read_bytes(), "application/octet-stream")
+        borders = borders_of(iso, areas)
+        if borders:
+            path = work / f"{iso}_borders.fgb"
+            b = compact(borders, BORDERS_SIMPLIFY_M)
+            b["level"] = [f["level"] for f in borders]
+            b.drop(columns=["lon", "lat"]).to_file(path, driver="FlatGeobuf")
+            store.put(f"{PARTS}{iso}_borders.fgb", path.read_bytes(), "application/octet-stream")
+        line["regions"] = max(0, len(borders) - 1)
         store.put(f"{PARTS}{iso}.json", json.dumps(line).encode(), "application/json")
         log(f"  {iso}: {line} ({time.time() - t0:.0f} s)")
         return line
@@ -201,21 +229,28 @@ def country_part(store, iso: str, log=print, fetch=download) -> dict:
 def merge(store, log=print) -> dict:
     """The countries' parts joined into the files the viewer reads, and the report."""
     import geopandas as gpd
+    import pandas as pd
 
-    report, parts = {}, []
+    report, parts, borders = {}, [], []
     with tempfile.TemporaryDirectory() as t:
         work = Path(t)
         for key in sorted(store.list(PARTS)):
-            iso = key.rsplit("/", 1)[1].split(".")[0]
-            if key.endswith(".json"):
-                report[iso] = json.loads(store.get(key))
-            elif key.endswith(".fgb"):
-                path = work / f"{iso}.fgb"
+            name = key.rsplit("/", 1)[1]
+            if name.endswith(".json"):
+                report[name.split(".")[0]] = json.loads(store.get(key))
+            elif name.endswith(".fgb"):
+                path = work / name
                 path.write_bytes(store.get(key))
-                parts.append(gpd.read_file(path))
+                (borders if name.endswith("_borders.fgb") else parts).append(gpd.read_file(path))
         if not parts:
             raise SystemExit("no country parts to merge")
         fgb, names, n = write(parts, work)
+        if borders:
+            path = work / "borders_osm.fgb"
+            pd.concat(borders, ignore_index=True).drop_duplicates("id").to_file(
+                path, driver="FlatGeobuf", SPATIAL_INDEX="YES"
+            )
+            store.put(PREFIX + "borders_osm.fgb", path.read_bytes(), "application/octet-stream")
     store.put(PREFIX + "municipalities.fgb", fgb, "application/octet-stream")
     store.put(PREFIX + "municipalities.json", names, "application/json")
     summary = {"source": ATTRIBUTION, "updated": time.strftime("%Y-%m-%d"), "countries": report}
