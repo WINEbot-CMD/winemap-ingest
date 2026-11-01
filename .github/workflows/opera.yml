@@ -1,0 +1,34 @@
+# Every 15 minutes: the European radar rain (EUMETNET OPERA composites, CC BY 4.0, open bucket) mirrored into R2 for
+# the viewer's Europe view (backlog 1.6, docs/38 §10): rain rate every 15 min and 1-hour sums, the last 48 hours.
+name: Europe radar (15 min)
+
+on:
+  schedule:
+    - cron: "4,19,34,49 * * * *" # a few minutes after the composite times (they arrive ~5-10 minutes late)
+  workflow_dispatch:
+
+concurrency:
+  group: opera
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  opera:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Copy the new composites
+        env:
+          WX_STORE: r2
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python -m winemap_ingest.opera
