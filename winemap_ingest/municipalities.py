@@ -11,8 +11,10 @@ many. Kept: the areas whose inside point lies in the country (the extracts reach
     regions/eu/municipalities.json   name search: [name, iso, lon, lat] per municipality
     regions/eu/municipalities_report.json   per country: level, count, expected, source date
     regions/eu/borders_osm.fgb       the countries (level 2) and their provinces / regions (level 4) from the same
-                                     data, EPSG:3035, ~30 m: on the aerial photo every level lines up (Jasper, 1 Nov
-                                     2026: geoBoundaries, Natural Earth and OSM side by side did not)
+                                     data, EPSG:3035, ~30 m: every level lines up (Jasper, 1 Nov 2026: geoBoundaries,
+                                     Natural Earth and OSM side by side did not)
+    regions/eu/regions_osm.geojson   the regions only, ~1 km simplified, with names: zoomed out, Analytics' regions
+                                     and the search
 
 In the workflow one job per country (a whole run in one job ran out of memory at Germany, 1 Nov 2026) writes its part,
 then one job joins them:
@@ -42,11 +44,14 @@ LEVELS = (6, 7, 8, 9)
 READ_SIMPLIFY_DEG = 0.00005  # ~5 m: kept finer than the final 20 m, but no full-detail rings held in memory
 SIMPLIFY_M = 20
 BORDERS_SIMPLIFY_M = 30  # countries and regions: drawn from country zoom on
+REGIONS_OVERVIEW_M = 1000  # the regions' overview file
 ATTRIBUTION = "© OpenStreetMap contributors (ODbL)"
 
 # ISO -> (Geofabrik name, about how many municipalities the country has)
 COUNTRIES: dict[str, tuple[str, int]] = {
-    "AL": ("albania", 61), "AT": ("austria", 2093), "BA": ("bosnia-herzegovina", 143), "BE": ("belgium", 565),
+    "AD": ("andorra", 7), "AL": ("albania", 61), "BY": ("belarus", 1200), "FO": ("faroe-islands", 29),
+    "IS": ("iceland", 64), "LI": ("liechtenstein", 11), "MC": ("monaco", 1), "AT": ("austria", 2093),
+    "BA": ("bosnia-herzegovina", 143), "BE": ("belgium", 565),
     "BG": ("bulgaria", 265), "CH": ("switzerland", 2121), "CY": ("cyprus", 380), "CZ": ("czech-republic", 6258),
     "DE": ("germany", 10751), "DK": ("denmark", 98), "EE": ("estonia", 79), "ES": ("spain", 8132),
     "FI": ("finland", 308), "FR": ("france", 34935), "GB": ("united-kingdom", 360), "GE": ("georgia", 69),
@@ -81,7 +86,7 @@ def boundaries(pbf: Path) -> list[dict]:
             level = int(tags.get("admin_level", ""))
         except ValueError:
             continue
-        if level not in (2, 3, 4, *LEVELS):  # 2-4 for the country's outline, see country_of
+        if level not in (2, 3, 4, 5, *LEVELS):  # 2-4 for the country's outline (country_of), 4-6 its regions
             continue
         try:
             geom = wkb.loads(fab.create_multipolygon(a), hex=True).simplify(READ_SIMPLIFY_DEG, preserve_topology=True)
@@ -142,17 +147,18 @@ def municipalities_of(iso: str, areas: list[dict]) -> tuple[list[dict], dict]:
 
 
 def borders_of(iso: str, areas: list[dict]) -> list[dict]:
-    """The country's outline (level 2) and its provinces / regions (level 4), from the same extract as its
-    municipalities, so all share the same line pieces."""
+    """The country's outline (level 2) and its provinces / regions, from the same extract as its municipalities, so
+    all share the same line pieces. Regions are level 4; a country without them (Luxembourg's cantons are level 6)
+    takes the next level that has some, below its municipalities."""
     from shapely import prepared
 
     country = country_of(iso, areas)
     if country is None:
         return []
     inside = prepared.prep(country)
-    regions = [
-        dict(a, iso=iso) for a in areas if a["level"] == 4 and inside.contains(a["geometry"].representative_point())
-    ]
+    ours = [a for a in areas if a["level"] in (4, 5, 6) and inside.contains(a["geometry"].representative_point())]
+    level = next((lv for lv in (4, 5, 6) if any(a["level"] == lv for a in ours)), None)
+    regions = [dict(a, iso=iso, level=4) for a in ours if a["level"] == level]  # shown as the region level
     return [{"id": f"c{iso}", "level": 2, "name": iso, "iso": iso, "geometry": country}, *regions]
 
 
@@ -246,11 +252,15 @@ def merge(store, log=print) -> dict:
             raise SystemExit("no country parts to merge")
         fgb, names, n = write(parts, work)
         if borders:
+            all_borders = pd.concat(borders, ignore_index=True).drop_duplicates("id")
             path = work / "borders_osm.fgb"
-            pd.concat(borders, ignore_index=True).drop_duplicates("id").to_file(
-                path, driver="FlatGeobuf", SPATIAL_INDEX="YES"
-            )
+            all_borders.to_file(path, driver="FlatGeobuf", SPATIAL_INDEX="YES")
             store.put(PREFIX + "borders_osm.fgb", path.read_bytes(), "application/octet-stream")
+            overview = all_borders[all_borders["level"] == 4].copy()
+            overview["geometry"] = overview.geometry.simplify(REGIONS_OVERVIEW_M, preserve_topology=True)
+            path = work / "regions_osm.geojson"
+            overview[["id", "name", "iso", "geometry"]].to_file(path, driver="GeoJSON", COORDINATE_PRECISION=0)
+            store.put(PREFIX + "regions_osm.geojson", path.read_bytes(), "application/geo+json")
     store.put(PREFIX + "municipalities.fgb", fgb, "application/octet-stream")
     store.put(PREFIX + "municipalities.json", names, "application/json")
     summary = {"source": ATTRIBUTION, "updated": time.strftime("%Y-%m-%d"), "countries": report}
