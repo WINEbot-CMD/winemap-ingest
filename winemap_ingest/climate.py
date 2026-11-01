@@ -542,7 +542,8 @@ def main(argv: list[str] | None = None) -> None:
         report("era5land", store, f"{n} months written")
     elif a.cmd == "era5-world":
         n = run_era5_world(store, a.minutes, a.years, a.parallel)
-        report("era5land-world", store, f"{n} months written")
+        waiting = not europe_complete(store)  # the status page says why nothing came (Jasper: "Europe first")
+        report("era5land-world", store, "waiting: Europe first" if waiting else f"{n} years written")
     elif a.cmd == "pack-knmi":
         n = pack_local_knmi(store, a.raw, a.years)
     else:
