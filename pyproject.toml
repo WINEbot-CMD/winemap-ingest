@@ -3,7 +3,7 @@ name = "winemap-ingest"
 version = "0.1.0"
 description = "Hourly KNMI precipitation sums for Winemap (Live / Season)"
 requires-python = ">=3.11"
-dependencies = ["numpy", "h5py", "rasterio", "pyproj", "boto3", "netCDF4", "cdsapi", "imagecodecs"]
+dependencies = ["numpy", "h5py", "rasterio", "pyproj", "boto3", "netCDF4", "cdsapi", "imagecodecs", "osmium", "pyogrio", "shapely", "geopandas", "certifi"]
 
 [tool.ruff]
 line-length = 120

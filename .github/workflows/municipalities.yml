@@ -1,0 +1,41 @@
+# Monthly: Europe's municipality borders from OpenStreetMap (ODbL), per country from the Geofabrik extracts, for the
+# viewer's white borders on the aerial photo and the municipalities in Analytics (Jasper, 1 Nov 2026).
+# One country at a time: download, read the boundaries, keep the small result, delete the extract.
+name: Municipalities (OpenStreetMap)
+
+on:
+  schedule:
+    - cron: "30 2 3 * *" # the 3rd of each month (Geofabrik's extracts are daily)
+  workflow_dispatch:
+    inputs:
+      countries:
+        description: "ISO codes, space separated (empty = all)"
+        required: false
+        default: ""
+
+concurrency:
+  group: municipalities
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  municipalities:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Build the municipalities
+        env:
+          WX_STORE: r2
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          COUNTRIES: ${{ inputs.countries }} # an input goes in as a variable, never into the script itself
+        run: python -m winemap_ingest.municipalities $COUNTRIES
