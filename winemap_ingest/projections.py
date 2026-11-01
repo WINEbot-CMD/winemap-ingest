@@ -9,8 +9,10 @@ year are stored:
     projections/cckp/<region>/<model>/<scenario>.nc     int16 (year, lat, lon) per BCI, scaled, zlib
 
 Models: 8 within the IPCC "likely" climate sensitivity (ECS 2.5-4 degC, TCR 1.4-2.2 degC) + EC-Earth3 (the model
-behind KNMI'23) for comparison; all 9 kept apart (Jasper). Scenarios SSP2-4.5 and SSP5-8.5. Region now Europe; the
-world follows (needs the Southern Hemisphere season).
+behind KNMI'23) for comparison; all 9 kept apart (Jasper). Scenarios SSP2-4.5 and SSP5-8.5. Regions: Europe, and the
+world's wine belts with a wide margin (Jasper, 1 Nov 2026), a northern band 20-62 N and a southern band 8-56 S, all
+the way round. The Southern Hemisphere's season is October - April: its year is the vintage, the year the season ends
+(Oct 2025 - Apr 2026 = 2026); Huglin October - April (standard October - March), EFD 15 October - 30 November.
 
 BCIs from monthly values, the same definitions as winemap-compute bci.py (season 1 Apr - 31 Oct, Tgem = (Tmax +
 Tmin) / 2, Huglin k per latitude): Huglin per month = days x max(0, (Tgem + Tmax) / 2 - 10) x k (measured on ERA5:
@@ -53,10 +55,19 @@ MODELS = ENSEMBLE + COMPARE
 SCENARIOS = ["ssp245", "ssp585"]
 VARS = ["tasmax", "tasmin", "pr", "hd35", "tr", "fd"]
 FIRST_YEAR, LAST_YEAR = 2015, 2100
-# region -> (lon0, lat0, lon1, lat1); Europe as in the Europe view
-REGIONS = {"eu": (-25.0, 34.0, 45.0, 72.0)}
-MONTHS = [4, 5, 6, 7, 8, 9, 10]  # the season, April - October
-DAYS = np.array([30, 31, 30, 31, 31, 30, 31], dtype="f8")
+# region -> ((lon0, lat0, lon1, lat1), hemisphere); Europe as in the Europe view, the world's wine belts with a margin
+# (Okanagan 50 N and southern Sweden 58 N in the north; Brazil's São Francisco valley 9 S to Central Otago 45 S)
+REGIONS = {
+    "eu": ((-25.0, 34.0, 45.0, 72.0), "N"),
+    "world_n": ((-180.0, 20.0, 180.0, 62.0), "N"),
+    "world_s": ((-180.0, -56.0, 180.0, -8.0), "S"),
+}
+# the season per hemisphere: its months in order and their days (February as 28.25)
+SEASONS = {
+    "N": ([4, 5, 6, 7, 8, 9, 10], np.array([30, 31, 30, 31, 31, 30, 31], dtype="f8")),  # April - October
+    "S": ([10, 11, 12, 1, 2, 3, 4], np.array([31, 30, 31, 31, 28.25, 31, 30], dtype="f8")),  # October - April
+}
+MONTHS, DAYS = SEASONS["N"]
 # id -> the scale for int16 (the scales of winemap-compute's curves)
 BCIS = {"EHI": 10, "HI": 10, "GST": 100, "GSP": 10, "EFD": 100, "EHD": 100, "TN": 100}
 FILL = np.int16(-32768)
@@ -87,27 +98,45 @@ def window(lat: np.ndarray, lon: np.ndarray, box) -> tuple[int, int, np.ndarray,
     return int(rows[0]), int(rows[-1]) + 1, cols, lat[rows], lon180[cols]
 
 
-def read_var(grid, box, threads: int = 16) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def season_steps(hemisphere: str = "N") -> list[int]:
+    """The time steps (months since January FIRST_YEAR) of every year's season; -1 where it starts before the data
+    (the Southern Hemisphere's first season, October - December of the year before)."""
+    months, _ = SEASONS[hemisphere]
+    out = []
+    for y in range(FIRST_YEAR, LAST_YEAR + 1):
+        for m in months:
+            year = y - 1 if hemisphere == "S" and m >= 10 else y  # the vintage: the season ends in its year
+            out.append((year - FIRST_YEAR) * 12 + m - 1 if year >= FIRST_YEAR else -1)
+    return out
+
+
+def read_var(grid, box, threads: int = 16, hemisphere: str = "N") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(years, months, lat, lon) float32 of one variable: the season months of every year, the box only."""
     r0, r1, cols, lat, lon = window(grid.lat, grid.lon, box)
-    years = range(FIRST_YEAR, LAST_YEAR + 1)
-    months = [(y - FIRST_YEAR) * 12 + m - 1 for y in years for m in MONTHS]
+    steps = season_steps(hemisphere)
+    n_months = len(SEASONS[hemisphere][0])
+
+    def slab(t: int) -> np.ndarray:
+        return grid.rows(t, r0, r1)[:, cols] if t >= 0 else np.full((r1 - r0, len(cols)), np.nan, "f4")
+
     with ThreadPoolExecutor(threads) as ex:
-        slabs = list(ex.map(lambda t: grid.rows(t, r0, r1)[:, cols], months))
-    return np.stack(slabs).reshape(len(years), len(MONTHS), r1 - r0, len(cols)), lat, lon
+        slabs = list(ex.map(slab, steps))
+    return np.stack(slabs).reshape(len(steps) // n_months, n_months, r1 - r0, len(cols)), lat, lon
 
 
-def bcis(v: dict[str, np.ndarray], lat: np.ndarray) -> dict[str, np.ndarray]:
-    """The BCIs per year (year, lat, lon) from the season months (year, month, lat, lon)."""
+def bcis(v: dict[str, np.ndarray], lat: np.ndarray, hemisphere: str = "N") -> dict[str, np.ndarray]:
+    """The BCIs per year (year, lat, lon) from the season months (year, month, lat, lon). In the south the months run
+    October - April, so the same positions hold: the first six for HI, the first two for EFD."""
     tx, tn = v["tasmax"], v["tasmin"]
     tg = (tx + tn) / 2
-    days = DAYS[None, :, None, None]
+    season_days = SEASONS[hemisphere][1]
+    days = season_days[None, :, None, None]
     k = huglin_k(lat)[None, :, None]
     hug = days * np.maximum(0.0, (tg + tx) / 2 - 10)
     return {
         "EHI": hug.sum(1) * k,
-        "HI": hug[:, :6].sum(1) * k,  # April - September
-        "GST": (tg * days).sum(1) / DAYS.sum(),
+        "HI": hug[:, :6].sum(1) * k,  # April - September (south: October - March)
+        "GST": (tg * days).sum(1) / season_days.sum(),
         "GSP": v["pr"].sum(1),
         "EFD": 0.5 * v["fd"][:, 0] + v["fd"][:, 1],
         "EHD": v["hd35"].sum(1),
@@ -115,7 +144,9 @@ def bcis(v: dict[str, np.ndarray], lat: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
-def to_nc(out: dict[str, np.ndarray], lat: np.ndarray, lon: np.ndarray, model: str, scenario: str) -> bytes:
+def to_nc(
+    out: dict[str, np.ndarray], lat: np.ndarray, lon: np.ndarray, model: str, scenario: str, hemisphere: str = "N"
+) -> bytes:
     n_years = next(iter(out.values())).shape[0]
     with tempfile.TemporaryDirectory() as t:
         path = Path(t) / "p.nc"
@@ -133,7 +164,10 @@ def to_nc(out: dict[str, np.ndarray], lat: np.ndarray, lon: np.ndarray, model: s
                 v.set_auto_maskandscale(False)
                 v[:] = q
                 v.scale_factor = 1 / scale
-            o.EFD_note = "approximated from monthly frost-day counts: 0.5 x April + May"
+            o.EFD_note = "approximated from monthly frost-day counts: " + (
+                "0.5 x October + November" if hemisphere == "S" else "0.5 x April + May"
+            )
+            o.season = "October - April, the year is the vintage" if hemisphere == "S" else "April - October"
             o.model, o.scenario = model, scenario
             o.source = "World Bank Climate Change Knowledge Portal (CCKP), CMIP6 0.25 degree time series; CC BY 4.0"
             o.created = datetime.now(UTC).isoformat(timespec="seconds")
@@ -161,7 +195,7 @@ def progress(store, region: str, result: str) -> dict:
 
 def run(store, models: list[str], region: str = "eu", log=print, open_grid=RemoteGrid) -> int:
     """Each missing model run: read the six variables, compute the BCIs, store one file. Returns the runs written."""
-    box = REGIONS[region]
+    box, hemisphere = REGIONS[region]
     have = set(store.list(f"projections/cckp/{region}/"))
 
     def status(result: str) -> None:
@@ -175,9 +209,9 @@ def run(store, models: list[str], region: str = "eu", log=print, open_grid=Remot
             v = {}
             for i, var in enumerate(VARS, 1):
                 status(f"running: {model.split('-r1')[0]} {scenario} {var} ({i}/{len(VARS)})")
-                v[var], lat, lon = read_var(open_grid(url(var, model, scenario)), box)
+                v[var], lat, lon = read_var(open_grid(url(var, model, scenario)), box, hemisphere=hemisphere)
                 log(f"{model} {scenario} {var}: {v[var].shape}")
-            raw = to_nc(bcis(v, lat), lat, lon, model, scenario)
+            raw = to_nc(bcis(v, lat, hemisphere), lat, lon, model, scenario, hemisphere)
             store.put(key(region, model, scenario), raw, "application/x-netcdf")
             n += 1
             log(f"written {key(region, model, scenario)}")

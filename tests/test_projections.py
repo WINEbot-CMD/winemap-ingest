@@ -1,5 +1,6 @@
 import netCDF4
 import numpy as np
+import pytest
 
 from winemap_ingest import projections
 from winemap_ingest.store import LocalStore
@@ -26,7 +27,7 @@ class FakeGrid:
 def test_window_wraps_greenwich_and_cuts_the_box():
     lat = np.arange(-90.0, 90.25, 0.25)
     for lon in (np.arange(-180, 180, 0.25), np.arange(0, 360, 0.25)):  # both conventions
-        r0, r1, cols, la, lo = projections.window(lat, lon, projections.REGIONS["eu"])
+        r0, r1, cols, la, lo = projections.window(lat, lon, projections.REGIONS["eu"][0])
         assert la[0] == 34 and la[-1] == 72 and r1 - r0 == len(la)
         assert lo[0] == -25 and lo[-1] == 45 and np.all(np.diff(lo) > 0)
 
@@ -64,3 +65,24 @@ def test_run_writes_one_file_per_model_run_and_skips_done(tmp_path, monkeypatch)
     assert key == "cckp-eu" and last["files"] == last["total"] == 2
     assert last["detail"] == "SSP245 1 / 1 · SSP585 1 / 1" and last["manual"]
     assert reported[0][1]["lastResult"].startswith("running: m1 ssp585 tasmax (1/6)")
+
+
+def test_southern_season_is_october_to_april_and_the_year_is_the_vintage():
+    steps = projections.season_steps("S")
+    assert steps[:3] == [-1, -1, -1]  # 2015's season would start in October 2014: before the data
+    assert steps[3:7] == [0, 1, 2, 3]  # January - April 2015
+    assert steps[7:10] == [9, 10, 11]  # the 2016 vintage starts in October 2015
+    assert projections.season_steps("N")[:7] == [3, 4, 5, 6, 7, 8, 9]  # April - October 2015
+
+
+def test_southern_bcis_use_the_southern_months():
+    shape = (1, 7, 1, 1)
+    v = {k: np.zeros(shape) for k in ("hd35", "tr", "pr")}
+    v["tasmax"] = np.full(shape, 30.0)
+    v["tasmin"] = np.full(shape, 10.0)
+    v["fd"] = np.zeros(shape)
+    v["fd"][0, 0], v["fd"][0, 1] = 4, 2  # October, November
+    out = projections.bcis(v, np.array([-34.0]), "S")
+    days = projections.SEASONS["S"][1].sum()
+    assert out["EHI"][0, 0, 0] == pytest.approx(days * 15 * 1.02)  # (20 + 30) / 2 - 10 = 15 a day, k 1.02 at 34 S
+    assert out["EFD"][0, 0, 0] == pytest.approx(4)  # 0.5 x October + November
