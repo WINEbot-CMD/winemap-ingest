@@ -58,3 +58,13 @@ def test_run_writes_the_file_the_names_and_the_report(tmp_path, monkeypatch):
     assert list(borders["level"]) == [2] and borders["iso"][0] == "LU"  # the country (no level-4 regions here)
     info = pyogrio.read_info(tmp_path / "store" / mu.PREFIX / "municipalities.fgb")
     assert info["features"] == 10 and "3035" in info["crs"]
+
+
+def test_regions_cover_the_country_and_are_coarser_than_the_municipalities():
+    country = area("c", 2, 0, 0, 10, 10, iso="PT")
+    islands = [area("i1", 4, 8, 8, 9, 9), area("i2", 4, 9, 9, 10, 10)]  # level 4: only the archipelagos
+    districts = [area(f"d{i}", 6, 0, i * 2, 10, i * 2 + 2) for i in range(5)]  # level 6 covers it all
+    regions = [b for b in mu.borders_of("PT", [country, *islands, *districts], below=7) if b["level"] == 4]
+    assert {r["id"] for r in regions} == {f"d{i}" for i in range(5)}
+    # the same level as the municipalities: no regions (Montenegro's level 6)
+    assert [b for b in mu.borders_of("PT", [country, *districts], below=6) if b["level"] == 4] == []
