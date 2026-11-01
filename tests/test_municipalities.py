@@ -54,5 +54,7 @@ def test_run_writes_the_file_the_names_and_the_report(tmp_path, monkeypatch):
     assert names[0][0].startswith("Gemeng") and names[0][1] == "LU" and 6.0 < names[0][2] < 6.2
     import pyogrio
 
+    borders = pyogrio.read_dataframe(tmp_path / "store" / mu.PREFIX / "borders_osm.fgb")
+    assert list(borders["level"]) == [2] and borders["iso"][0] == "LU"  # the country (no level-4 regions here)
     info = pyogrio.read_info(tmp_path / "store" / mu.PREFIX / "municipalities.fgb")
     assert info["features"] == 10 and "3035" in info["crs"]
