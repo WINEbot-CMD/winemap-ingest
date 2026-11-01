@@ -33,6 +33,7 @@ PRODUCTS = ("RATE", "ACRR")
 PREFIX = "rain/eu/"
 INDEX = PREFIX + "index.json"
 KEEP = timedelta(hours=48)
+BUDGET = timedelta(minutes=6)  # the workflow stops a run after 10 minutes
 NAME = re.compile(r"OPERA@(\d{8}T\d{4})@0@(RATE|ACRR)\.tiff$")
 COG = dict(compress="DEFLATE", predictor=3, blocksize=512, overview_resampling="average", BIGTIFF="NO")
 ATTRIBUTION = "EUMETNET OPERA radar composite (CC BY 4.0), via MeteoGate"
@@ -88,23 +89,30 @@ def clean(raw: bytes) -> tuple[bytes, dict]:
         return dst.read_bytes(), grid
 
 
-def run(store, now: datetime | None = None, log=print) -> int:
-    """Copy what is new, drop what is too old, write the index. Returns the files copied."""
+def run(store, now: datetime | None = None, log=print, budget: timedelta = BUDGET) -> int:
+    """Copy what is new (the newest first, for at most `budget`: a first run catches up over a few runs), drop what is
+    too old, write the index. What is already in the bucket counts, also when an earlier run stopped. Returns the
+    files copied."""
     now = now or datetime.now(UTC)
+    start = datetime.now(UTC)
     index = json.loads(store.get(INDEX) or b"{}")
     have = {p: set(index.get(p, [])) for p in PRODUCTS}
+    for p in PRODUCTS:  # files an interrupted run copied but did not index
+        have[p] |= {k.rsplit("/", 1)[1][:-4] for k in store.list(f"{PREFIX}{p}/") if k.endswith(".tif")}
+    todo = [(p, k, t) for day in (now - timedelta(days=1), now) for p, k, t in listing(day)]
+    todo = sorted((x for x in todo if stamp(x[2]) not in have[x[0]] and now - x[2] <= KEEP), key=lambda x: x[2],
+                  reverse=True)  # fmt: skip
     n = 0
-    for day in (now - timedelta(days=1), now):
-        for product, key, t in listing(day):
-            s = stamp(t)
-            if s in have[product] or now - t > KEEP:
-                continue
-            with urllib.request.urlopen(f"{BUCKET}/{key}", timeout=120) as r:
-                data, grid = clean(r.read())
-            store.put(f"{PREFIX}{product}/{s}.tif", data, "image/tiff")
-            have[product].add(s)
-            index["grid"] = grid
-            n += 1
+    for product, key, t in todo:
+        if datetime.now(UTC) - start > budget:
+            log(f"time is up: {len(todo) - n} files left for the next run")
+            break
+        with urllib.request.urlopen(f"{BUCKET}/{key}", timeout=120) as r:
+            data, grid = clean(r.read())
+        store.put(f"{PREFIX}{product}/{stamp(t)}.tif", data, "image/tiff")
+        have[product].add(stamp(t))
+        index["grid"] = grid
+        n += 1
     # older than KEEP: out of the index and the bucket
     for product in PRODUCTS:
         old = {s for s in have[product] if now - parse_stamp(s) > KEEP}

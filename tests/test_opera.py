@@ -58,3 +58,15 @@ def test_run_copies_new_files_and_drops_old_ones(tmp_path, monkeypatch):
     assert store.get(f"rain/eu/RATE/{opera.stamp(old)}.tif") is None  # removed
     assert "CC BY 4.0" in index["source"] and index["grid"]["res"] == 2000
     assert opera.run(store, now, log=lambda *_: None) == 0  # nothing new the second time
+
+
+def test_run_stops_in_time_and_counts_files_an_interrupted_run_left(tmp_path, monkeypatch):
+    now = datetime(2026, 11, 1, 9, 30, tzinfo=UTC)
+    store = LocalStore(tmp_path / "store")
+    store.put(f"rain/eu/RATE/{opera.stamp(now - timedelta(minutes=15))}.tif", b"left by a stopped run")  # no index
+    keys = [("RATE", f"k/{i}", now - timedelta(minutes=15 * i)) for i in range(1, 4)]
+    monkeypatch.setattr(opera, "listing", lambda day: keys if day.date() == now.date() else [])
+    monkeypatch.setattr(opera.urllib.request, "urlopen", lambda url, timeout=0: (_ for _ in ()).throw(AssertionError))
+    assert opera.run(store, now, log=lambda *_: None, budget=timedelta(seconds=-1)) == 0  # no time: copies nothing
+    index = json.loads(store.get(opera.INDEX))
+    assert index["RATE"] == ["20261101T0915"]  # but the index has what is there
