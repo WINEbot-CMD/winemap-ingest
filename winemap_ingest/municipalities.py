@@ -64,6 +64,24 @@ COUNTRIES: dict[str, tuple[str, int]] = {
 }  # fmt: skip
 
 
+def prefilter(pbf: Path, log=print) -> Path:
+    """Only the administrative boundaries (with their ways and nodes) of an extract, by osmium-tool when it is there
+    (the workflow installs it): France's 5 GB took Python over 90 minutes, the boundaries alone take minutes."""
+    import shutil
+    import subprocess
+
+    tool = shutil.which("osmium")
+    if not tool:
+        return pbf
+    out = pbf.with_name(pbf.stem + ".adm.pbf")
+    t = time.time()
+    cmd = [tool, "tags-filter", str(pbf), "r/boundary=administrative", "-o", str(out), "--overwrite"]
+    subprocess.run(cmd, check=True)
+    pbf.unlink(missing_ok=True)
+    log(f"  boundaries only: {out.stat().st_size / 1e6:.0f} MB in {time.time() - t:.0f} s")
+    return out
+
+
 def boundaries(pbf: Path) -> list[dict]:
     """The administrative areas of an extract: OSM id, level, name, ISO country code (level 2), shapely geometry.
     The node locations go into a file beside the extract, not into memory (Germany's ~450 M nodes)."""
@@ -210,7 +228,7 @@ def country_part(store, iso: str, log=print, fetch=download) -> dict:
     """One country: its municipalities as a part (FlatGeobuf with the name points) and its report line."""
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as t:
         work = Path(t)
-        pbf = fetch(COUNTRIES[iso][0], work, log=log)
+        pbf = prefilter(fetch(COUNTRIES[iso][0], work, log=log), log=log)
         t0 = time.time()
         areas = boundaries(pbf)
         pbf.unlink(missing_ok=True)
