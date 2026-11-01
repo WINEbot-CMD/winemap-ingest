@@ -217,9 +217,16 @@ def days_in(store, key: str) -> int:
 # ---------------------------------------------------------------- ERA5-Land
 
 
-def era5_requests(year: int, month: int, area: list[float] = ERA5_AREA):
-    """(var, dataset, request) for one month: three temperature statistics and the rain."""
-    base = {"year": str(year), "month": [f"{month:02d}"], "day": [f"{d:02d}" for d in range(1, 32)], "area": area}
+def era5_requests(year: int, month: int | list[int], area: list[float] = ERA5_AREA):
+    """(var, dataset, request) for one month (or several: the world asks a year at a time): three temperature
+    statistics and the rain."""
+    months = month if isinstance(month, list) else [month]
+    base = {
+        "year": str(year),
+        "month": [f"{m:02d}" for m in months],
+        "day": [f"{d:02d}" for d in range(1, 32)],
+        "area": area,
+    }
     for var, stat in ERA5_STATS.items():
         yield (
             var,
@@ -245,8 +252,8 @@ def era5_requests(year: int, month: int, area: list[float] = ERA5_AREA):
     )
 
 
-def era5_pack(var: str, raw: bytes) -> bytes:
-    """One CDS month file -> our month file (degC / mm; rain moved to the day it fell)."""
+def era5_read(var: str, raw: bytes) -> tuple[np.ndarray, list[date], dict]:
+    """A CDS file: the values (time, lat, lon), the day of each step, the coordinates."""
     with netCDF4.Dataset("era5.nc", memory=raw) as d:
         name = "tp" if var == "rr" else "t2m"
         a = np.ma.filled(d[name][:].astype(np.float64), np.nan)
@@ -254,6 +261,27 @@ def era5_pack(var: str, raw: bytes) -> bytes:
         stamps = netCDF4.num2date(t[:], t.units, only_use_cftime_datetimes=False)
         days = [date(s.year, s.month, s.day) for s in stamps]
         coords = {"latitude": np.asarray(d["latitude"][:]), "longitude": np.asarray(d["longitude"][:])}
+    return a, days, coords
+
+
+def era5_pack(var: str, raw: bytes) -> bytes:
+    """One CDS month file -> our month file (degC / mm; rain moved to the day it fell)."""
+    return era5_pack_steps(var, *era5_read(var, raw))
+
+
+def era5_pack_months(var: str, raw: bytes) -> dict[tuple[int, int], bytes]:
+    """A CDS file of several months (the world asks a year at a time) -> our month files, each packed exactly as a
+    month asked on its own (split on the month of the time steps, before the rain moves a day back)."""
+    a, days, coords = era5_read(var, raw)
+    out = {}
+    for ym in sorted({(d.year, d.month) for d in days}):
+        idx = [i for i, d in enumerate(days) if (d.year, d.month) == ym]
+        out[ym] = era5_pack_steps(var, a[idx], [days[i] for i in idx], coords)
+    return out
+
+
+def era5_pack_steps(var: str, a: np.ndarray, days: list[date], coords: dict) -> bytes:
+    """Steps of one month -> our month file."""
     if var == "rr":
         a = a * 1000.0  # m -> mm
         days = [x - timedelta(days=1) for x in days]  # 00 UTC = the total of the day before
@@ -325,24 +353,30 @@ def run_era5_world(store, minutes: float, years=None, parallel: int = 3, log=pri
         have |= set(store.list(f"climate/era5land/{region}/"))
     today = date.today()
     last = date(today.year, today.month, 1) - timedelta(days=1)
-    todo = [
-        (world_key(region, var, year, month), dataset, request)
-        for year, month in months_newest_first(WORLD_FIRST_YEAR, last, years)
-        for region, area in WORLD_AREAS.items()
-        for var, dataset, request in era5_requests(year, month, area)
-    ]
-    todo = [t for t in todo if t[0] not in have]
-    log(f"{len(todo)} world month files to go")
+    # one request per area, variable and year (the CDS queue waits about as long for a month as for a year; 1 Nov
+    # 2026: ~80 minutes), only the months still missing; stored per month as Europe's
+    y1, y0 = years if years else (last.year, WORLD_FIRST_YEAR)
+    todo = []
+    for year in range(y1, y0 - 1, -1):
+        for region in WORLD_AREAS:
+            for var in VARS:
+                months = [m for m in range(1, 13) if date(year, m, 1) <= last]
+                months = [m for m in months if world_key(region, var, year, m) not in have]
+                if months:
+                    todo.append((region, var, year, months))
+    log(f"{len(todo)} world requests to go (a year, area and variable each)")
 
     def fetch(job) -> str:
-        key, dataset, request = job
+        region, var, year, months = job
+        _, dataset, request = next(r for r in era5_requests(year, months, WORLD_AREAS[region]) if r[0] == var)
         client = cdsapi.Client(url=CDS_URL, key=os.environ["CDS_API_KEY"], quiet=True, progress=False)
         with tempfile.TemporaryDirectory() as tmp:
             part = Path(tmp) / "cds.nc"
             client.retrieve(dataset, request).download(str(part))
-            var = key.split("/")[3]
-            store.put(key, era5_pack(var, part.read_bytes()), "application/x-netcdf")
-        return key
+            for (y, m), data in era5_pack_months(var, part.read_bytes()).items():
+                if y == year and m in months:
+                    store.put(world_key(region, var, y, m), data, "application/x-netcdf")
+        return f"{region} {var} {year} ({len(months)} months)"
 
     done = failed = 0
     jobs = iter(todo)
@@ -353,7 +387,7 @@ def run_era5_world(store, minutes: float, years=None, parallel: int = 3, log=pri
                 job = next(jobs, None)
                 if job is None:
                     break
-                running[ex.submit(fetch, job)] = job[0]
+                running[ex.submit(fetch, job)] = f"{job[0]} {job[1]} {job[2]}"
             if not running:
                 return done
             finished, _ = wait(running, return_when=FIRST_COMPLETED)
