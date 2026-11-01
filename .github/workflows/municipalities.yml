@@ -1,6 +1,7 @@
 # Monthly: Europe's municipality borders from OpenStreetMap (ODbL), per country from the Geofabrik extracts, for the
 # viewer's white borders on the aerial photo and the municipalities in Analytics (Jasper, 1 Nov 2026).
-# One country at a time: download, read the boundaries, keep the small result, delete the extract.
+# One job per country (all countries in one job ran out of memory at Germany), each writing its part to R2; then one
+# job joins the parts. A country that fails keeps last month's part. The public repo: no cost for the minutes.
 name: Municipalities (OpenStreetMap)
 
 on:
@@ -20,10 +21,38 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  WX_STORE: r2
+  PYTHONUNBUFFERED: "1" # each country's line shows as it is done
+
 jobs:
-  municipalities:
+  countries:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    outputs:
+      list: ${{ steps.list.outputs.list }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        env:
+          COUNTRIES: ${{ inputs.countries }} # an input goes in as a variable, never into the script itself
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import ast, json, os, re
+          src = open("winemap_ingest/municipalities.py", encoding="utf-8").read()
+          known = sorted(ast.literal_eval(re.search(r"COUNTRIES[^=]*= (\{.*?\})  # fmt: skip", src, re.S).group(1)))
+          asked = [c.upper() for c in os.environ.get("COUNTRIES", "").split()]
+          print("list=" + json.dumps([c for c in asked if c in known] or known))
+          EOF
+
+  part:
+    needs: countries
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 4 # gentle on Geofabrik's servers
+      matrix:
+        iso: ${{ fromJson(needs.countries.outputs.list) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,11 +60,28 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Build the municipalities
+      - name: Municipalities of ${{ matrix.iso }}
         env:
-          WX_STORE: r2
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          COUNTRIES: ${{ inputs.countries }} # an input goes in as a variable, never into the script itself
-        run: python -m winemap_ingest.municipalities $COUNTRIES
+        run: python -m winemap_ingest.municipalities part ${{ matrix.iso }}
+
+  merge:
+    needs: part
+    if: ${{ !cancelled() }} # also when a country failed: the others (and its earlier part) still count
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Join the parts
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python -m winemap_ingest.municipalities merge

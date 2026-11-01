@@ -11,7 +11,12 @@ many. Kept: the areas whose inside point lies in the country (the extracts reach
     regions/eu/municipalities.json   name search: [name, iso, lon, lat] per municipality
     regions/eu/municipalities_report.json   per country: level, count, expected, source date
 
-    python -m winemap_ingest.municipalities [ISO ...]     # all countries, or these; monthly in the workflow
+In the workflow one job per country (a whole run in one job ran out of memory at Germany, 1 Nov 2026) writes its part,
+then one job joins them:
+
+    python -m winemap_ingest.municipalities part DE      # regions/eu/municipalities/parts/DE.fgb + DE.json
+    python -m winemap_ingest.municipalities merge        # the parts -> the files above
+    python -m winemap_ingest.municipalities [ISO ...]    # both, here and now (all countries, or these)
 """
 
 from __future__ import annotations
@@ -29,7 +34,9 @@ from .store import open_store
 
 GEOFABRIK = "https://download.geofabrik.de/europe/{}-latest.osm.pbf"
 PREFIX = "regions/eu/"
+PARTS = PREFIX + "municipalities/parts/"
 LEVELS = (6, 7, 8, 9)
+READ_SIMPLIFY_DEG = 0.00005  # ~5 m: kept finer than the final 20 m, but no full-detail rings held in memory
 SIMPLIFY_M = 20
 ATTRIBUTION = "© OpenStreetMap contributors (ODbL)"
 
@@ -49,14 +56,17 @@ COUNTRIES: dict[str, tuple[str, int]] = {
 
 
 def boundaries(pbf: Path) -> list[dict]:
-    """The administrative areas of an extract: OSM id, level, name, ISO country code (level 2), shapely geometry."""
+    """The administrative areas of an extract: OSM id, level, name, ISO country code (level 2), shapely geometry.
+    The node locations go into a file beside the extract, not into memory (Germany's ~450 M nodes)."""
     import osmium
     from shapely import wkb
 
     fab = osmium.geom.WKBFactory()
     out = []
+    nodes = pbf.with_suffix(".nodes")
     fp = (
         osmium.FileProcessor(str(pbf))
+        .with_locations(f"sparse_file_array,{nodes}")
         .with_areas(osmium.filter.TagFilter(("boundary", "administrative")))
         .with_filter(osmium.filter.EntityFilter(osmium.osm.AREA))
         .with_filter(osmium.filter.TagFilter(("boundary", "administrative")))
@@ -70,7 +80,7 @@ def boundaries(pbf: Path) -> list[dict]:
         if level not in (2, 3, 4, *LEVELS):  # 2-4 for the country's outline, see country_of
             continue
         try:
-            geom = wkb.loads(fab.create_multipolygon(a), hex=True)
+            geom = wkb.loads(fab.create_multipolygon(a), hex=True).simplify(READ_SIMPLIFY_DEG, preserve_topology=True)
         except Exception:  # noqa: BLE001 - a broken ring (cut off at the extract's edge): skipped
             continue
         out.append({
@@ -81,6 +91,11 @@ def boundaries(pbf: Path) -> list[dict]:
             "iso2": tags.get("ISO3166-2", ""),
             "geometry": geom,
         })  # fmt: skip
+    del fp  # closes the node file (Windows keeps an open file)
+    try:
+        nodes.unlink(missing_ok=True)
+    except PermissionError:
+        pass  # the temporary folder goes anyway
     return out
 
 
@@ -166,30 +181,64 @@ def write(parts: list, work: Path) -> tuple[bytes, bytes, int]:
     return path.read_bytes(), json.dumps(names, ensure_ascii=False, separators=(",", ":")).encode(), len(gdf)
 
 
-def run(store, only: list[str] | None = None, log=print, fetch=download) -> dict:
+def country_part(store, iso: str, log=print, fetch=download) -> dict:
+    """One country: its municipalities as a part (FlatGeobuf with the name points) and its report line."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as t:
+        work = Path(t)
+        pbf = fetch(COUNTRIES[iso][0], work, log=log)
+        t0 = time.time()
+        chosen, line = municipalities_of(iso, boundaries(pbf))
+        pbf.unlink(missing_ok=True)
+        if chosen:
+            path = work / f"{iso}.fgb"
+            compact(chosen).to_file(path, driver="FlatGeobuf")
+            store.put(f"{PARTS}{iso}.fgb", path.read_bytes(), "application/octet-stream")
+        store.put(f"{PARTS}{iso}.json", json.dumps(line).encode(), "application/json")
+        log(f"  {iso}: {line} ({time.time() - t0:.0f} s)")
+        return line
+
+
+def merge(store, log=print) -> dict:
+    """The countries' parts joined into the files the viewer reads, and the report."""
+    import geopandas as gpd
+
     report, parts = {}, []
     with tempfile.TemporaryDirectory() as t:
         work = Path(t)
-        for iso in only or sorted(COUNTRIES):
-            pbf = fetch(COUNTRIES[iso][0], work, log=log)
-            t0 = time.time()
-            chosen, line = municipalities_of(iso, boundaries(pbf))
-            pbf.unlink(missing_ok=True)
-            report[iso] = line
-            if chosen:
-                parts.append(compact(chosen))
-            log(f"  {iso}: {line} ({time.time() - t0:.0f} s)")
+        for key in sorted(store.list(PARTS)):
+            iso = key.rsplit("/", 1)[1].split(".")[0]
+            if key.endswith(".json"):
+                report[iso] = json.loads(store.get(key))
+            elif key.endswith(".fgb"):
+                path = work / f"{iso}.fgb"
+                path.write_bytes(store.get(key))
+                parts.append(gpd.read_file(path))
+        if not parts:
+            raise SystemExit("no country parts to merge")
         fgb, names, n = write(parts, work)
     store.put(PREFIX + "municipalities.fgb", fgb, "application/octet-stream")
     store.put(PREFIX + "municipalities.json", names, "application/json")
     summary = {"source": ATTRIBUTION, "updated": time.strftime("%Y-%m-%d"), "countries": report}
     store.put(PREFIX + "municipalities_report.json", json.dumps(summary, indent=1).encode(), "application/json")
-    log(f"{n} municipalities, {len(fgb) / 1e6:.0f} MB")
+    log(f"{n} municipalities in {len(parts)} countries, {len(fgb) / 1e6:.0f} MB")
     return summary
 
 
+def run(store, only: list[str] | None = None, log=print, fetch=download) -> dict:
+    """All countries (or these) and the merge, in one go."""
+    for iso in only or sorted(COUNTRIES):
+        country_part(store, iso, log=log, fetch=fetch)
+    return merge(store, log=log)
+
+
 def main() -> None:
-    run(open_store(), only=[a.upper() for a in sys.argv[1:]] or None)
+    args = sys.argv[1:]
+    if args[:1] == ["part"]:
+        country_part(open_store(), args[1].upper())
+    elif args[:1] == ["merge"]:
+        merge(open_store())
+    else:
+        run(open_store(), only=[a.upper() for a in args] or None)
 
 
 if __name__ == "__main__":
