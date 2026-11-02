@@ -40,7 +40,11 @@ from .store import open_store
 GEOFABRIK = "https://download.geofabrik.de/europe/{}-latest.osm.pbf"
 PREFIX = "regions/eu/"
 PARTS = PREFIX + "municipalities/parts/"
-LEVELS = (6, 7, 8, 9)
+LEVELS = (5, 6, 7, 8, 9)  # 5: Lithuania's and Latvia's municipalities
+# where the count alone picks wrong: Germany's level 9 (10 618) came nearer the number of Gemeinden than its level 8
+# (11 160, with the unincorporated areas), but the Gemeinden are level 8 (first run, 1 Nov 2026)
+LEVEL_OVERRIDE = {"DE": 8}
+REGION_COVER = 0.8  # a region level must cover this much of the country (Portugal's level 4 is the two archipelagos)
 READ_SIMPLIFY_DEG = 0.00005  # ~5 m: kept finer than the final 20 m, but no full-detail rings held in memory
 SIMPLIFY_M = 20
 BORDERS_SIMPLIFY_M = 30  # countries and regions: drawn from country zoom on
@@ -159,15 +163,16 @@ def municipalities_of(iso: str, areas: list[dict]) -> tuple[list[dict], dict]:
     inside = prepared.prep(country)
     candidates = [a for a in areas if a["level"] in LEVELS and inside.contains(a["geometry"].representative_point())]
     counts = {lv: sum(a["level"] == lv for a in candidates) for lv in LEVELS}
-    level = pick_level(counts, COUNTRIES[iso][1])
+    level = LEVEL_OVERRIDE.get(iso) or pick_level(counts, COUNTRIES[iso][1])
     chosen = [dict(a, iso=iso) for a in candidates if a["level"] == level]
     return chosen, {"level": level, "count": len(chosen), "expected": COUNTRIES[iso][1], "per_level": counts}
 
 
-def borders_of(iso: str, areas: list[dict]) -> list[dict]:
+def borders_of(iso: str, areas: list[dict], below: int | None = None) -> list[dict]:
     """The country's outline (level 2) and its provinces / regions, from the same extract as its municipalities, so
-    all share the same line pieces. Regions are level 4; a country without them (Luxembourg's cantons are level 6)
-    takes the next level that has some, below its municipalities."""
+    all share the same line pieces. Regions: the coarsest of levels 4-6 that covers most of the country (REGION_COVER;
+    Luxembourg's cantons are level 6, Portugal's level 4 only the archipelagos) and is coarser than its municipalities
+    (`below`); none when no level does."""
     from shapely import prepared
 
     country = country_of(iso, areas)
@@ -175,7 +180,14 @@ def borders_of(iso: str, areas: list[dict]) -> list[dict]:
         return []
     inside = prepared.prep(country)
     ours = [a for a in areas if a["level"] in (4, 5, 6) and inside.contains(a["geometry"].representative_point())]
-    level = next((lv for lv in (4, 5, 6) if any(a["level"] == lv for a in ours)), None)
+    level = None
+    for lv in (4, 5, 6):
+        if below is not None and lv >= below:
+            break
+        here = [a for a in ours if a["level"] == lv]
+        if len(here) >= 2 and sum(a["geometry"].area for a in here) >= REGION_COVER * country.area:
+            level = lv
+            break
     regions = [dict(a, iso=iso, level=4) for a in ours if a["level"] == level]  # shown as the region level
     return [{"id": f"c{iso}", "level": 2, "name": iso, "iso": iso, "geometry": country}, *regions]
 
@@ -237,7 +249,7 @@ def country_part(store, iso: str, log=print, fetch=download) -> dict:
             path = work / f"{iso}.fgb"
             compact(chosen).to_file(path, driver="FlatGeobuf")
             store.put(f"{PARTS}{iso}.fgb", path.read_bytes(), "application/octet-stream")
-        borders = borders_of(iso, areas)
+        borders = borders_of(iso, areas, below=line.get("level"))
         if borders:
             path = work / f"{iso}_borders.fgb"
             b = compact(borders, BORDERS_SIMPLIFY_M)
