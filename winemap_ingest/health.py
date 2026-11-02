@@ -26,12 +26,13 @@ from .store import open_store
 
 # the home page: every version of the site has it (the /api routes only exist after the monitoring release)
 SITES = {
-    "live": "https://winemap-nl.wopferu.workers.dev/",
+    # our own address since 2 Nov 2026 (the same Worker as winemap-nl.wopferu.workers.dev)
+    "live": "https://vinecontext.com/",
     # its own Worker since 29 Oct 2026, without Cloudflare Access (staging-winemap-nl… is a preview of the live Worker)
     "staging": "https://winemap-nl-staging.wopferu.workers.dev/",
 }
 STATE = "monitor/state.json"
-STATUS = "https://winemap-nl.wopferu.workers.dev/api/status"  # live: it has the secrets for the free-plan meter
+STATUS = "https://vinecontext.com/api/status"  # live: it has the secrets for the free-plan meter
 QUOTA_ALERT = 0.8
 INGEST_RUNS = "https://api.github.com/repos/WINEbot-CMD/winemap-ingest/actions/runs?per_page=30"
 NOWCAST_LATE = timedelta(minutes=45)
