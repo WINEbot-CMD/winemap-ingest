@@ -85,8 +85,10 @@ def check_site(url: str, headers: dict[str, str]) -> dict:
         req = urllib.request.Request(url, headers={"User-Agent": "winemap-health", **headers})
         with urllib.request.urlopen(req, timeout=20) as r:
             body = r.read()
-            ok = r.status == 200 and b"Winemap" in body and b"cloudflareaccess" not in body
-            detail = "ok" if ok else f"HTTP {r.status}, not the Winemap page (Access login page?)"
+            # the site's name since 1 Nov 2026 is Vine Context; "Winemap" still counts (an older build)
+            ours = b"Vine Context" in body or b"Winemap" in body
+            ok = r.status == 200 and ours and b"cloudflareaccess" not in body
+            detail = "ok" if ok else f"HTTP {r.status}, not the Vine Context page (Access login page?)"
     except Exception as e:  # noqa: BLE001
         ok, detail = False, str(e)[:160]
     return {"ok": ok, "ms": round((time.monotonic() - t0) * 1000), "detail": detail}

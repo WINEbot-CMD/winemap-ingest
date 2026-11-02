@@ -266,7 +266,29 @@ def merge(store, log=print) -> dict:
     summary = {"source": ATTRIBUTION, "updated": time.strftime("%Y-%m-%d"), "countries": report}
     store.put(PREFIX + "municipalities_report.json", json.dumps(summary, indent=1).encode(), "application/json")
     log(f"{n} municipalities in {len(parts)} countries, {len(fgb) / 1e6:.0f} MB")
+    status(store, report, n)
     return summary
+
+
+def status(store, report: dict, n: int) -> None:
+    """For the status page (Downloads): countries done against all, and how many municipalities."""
+    from datetime import UTC, datetime
+
+    from .climate import report as monitor
+
+    done = sum(1 for line in report.values() if line.get("count"))
+    entry = {
+        "org": "OpenStreetMap (Geofabrik)",
+        "title": f"Municipalities and borders, Europe ({len(COUNTRIES)} countries)",
+        "files": done,
+        "total": len(COUNTRIES),
+        "unit": "countries",
+        "detail": f"{n:,} municipalities".replace(",", " "),
+        "manual": True,  # monthly: no 'stale' warning between the runs
+        "lastRun": datetime.now(UTC).isoformat(timespec="seconds"),
+        "lastResult": f"{done} countries joined",
+    }
+    monitor(lambda: ("osm-municipalities", entry))
 
 
 def run(store, only: list[str] | None = None, log=print, fetch=download) -> dict:

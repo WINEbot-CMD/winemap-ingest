@@ -190,3 +190,28 @@ def test_keepalive_for_the_live_powersync_too(tmp_path):
     assert s["powersync"]["last_ok"] and s["powersync_live"]["last_ok"] is None
     assert list(s["problems"]) == ["powersync_live"]
     assert "(live)" in s["problems"]["powersync_live"]["message"]
+
+
+def test_site_check_knows_the_new_name(monkeypatch):
+    class Page:
+        status = 200
+
+        def __init__(self, body):
+            self.body = body
+
+        def read(self):
+            return self.body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    for body, ok in (
+        (b"<title>Vine Context</title>", True),
+        (b"<title>Winemap NL</title>", True),  # an older build
+        (b"<html>cloudflareaccess login</html>", False),
+    ):
+        monkeypatch.setattr(health.urllib.request, "urlopen", lambda req, timeout=0, b=body: Page(b))
+        assert health.check_site("https://x", {})["ok"] is ok
