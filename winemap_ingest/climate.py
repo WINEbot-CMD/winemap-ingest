@@ -340,10 +340,20 @@ def world_key(region: str, var: str, year: int, month: int) -> str:
     return f"climate/era5land/{region}/{var}/{year}/{year}-{month:02d}.nc"
 
 
-def run_era5_world(store, minutes: float, years=None, parallel: int = 3, log=print) -> int:
+def europe_complete(store) -> bool:
+    """Whether Europe's ERA5-Land history is in (it goes newest first, so its first month is the last to come)."""
+    return all(store.get(key_of("era5land", v, ERA5_FIRST_YEAR, 1)) is not None for v in VARS)
+
+
+def run_era5_world(store, minutes: float, years=None, parallel: int = 3, log=print, after_europe: bool = True) -> int:
     """The world's wine belts (WORLD_AREAS), newest month first, a few requests at a time (Jasper: in parallel to
     Europe's own job); each request with its own CDS client. Stops after 5 failures; the next run goes on."""
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    # Jasper, 1 Nov 2026: "Europe first": the world waits until Europe's history is in (one CDS queue for both)
+    if after_europe and not europe_complete(store):
+        log("Europe's ERA5-Land history is not complete yet: the world waits")
+        return 0
 
     import cdsapi
 
@@ -532,7 +542,8 @@ def main(argv: list[str] | None = None) -> None:
         report("era5land", store, f"{n} months written")
     elif a.cmd == "era5-world":
         n = run_era5_world(store, a.minutes, a.years, a.parallel)
-        report("era5land-world", store, f"{n} months written")
+        waiting = not europe_complete(store)  # the status page says why nothing came (Jasper: "Europe first")
+        report("era5land-world", store, "waiting: Europe first" if waiting else f"{n} years written")
     elif a.cmd == "pack-knmi":
         n = pack_local_knmi(store, a.raw, a.years)
     else:
