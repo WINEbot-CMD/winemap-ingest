@@ -217,6 +217,9 @@ def days_in(store, key: str) -> int:
 # ---------------------------------------------------------------- ERA5-Land
 
 
+ERA5_LAG_DAYS = 6  # ERA5-Land reaches a day about this long after it
+
+
 def era5_requests(year: int, month: int | list[int], area: list[float] = ERA5_AREA):
     """(var, dataset, request) for one month (or several: the world asks a year at a time): three temperature
     statistics and the rain."""
@@ -303,20 +306,34 @@ def era5_pack_steps(var: str, a: np.ndarray, days: list[date], coords: dict) -> 
     )
 
 
-def run_era5(store, minutes: float, years=None, log=print) -> int:
+def era5_due(store, key: str, var: str, year: int, month: int, have: set[str], today: date) -> bool:
+    """Whether to ask CDS for this month file. ERA5-Land runs ~5 days behind, so a month fetched right after it ended
+    stops short (October 2026 ended on the 26th and was never completed): a recent month that is short is fetched
+    again once its last day should be there. The running month only for the rain, once: its first step (00 UTC on the
+    1st) is the rain of the last day of the month before, which the season needs (Jasper, 5 Nov 2026)."""
+    end = date(year + (month == 12), month % 12 + 1, 1) - timedelta(days=1)
+    if end >= today:  # the running month
+        return var == "rr" and today.day >= ERA5_LAG_DAYS + 1 and key not in have
+    if key not in have:
+        return True
+    settled = today >= end + timedelta(days=ERA5_LAG_DAYS)
+    return settled and (today - end).days <= 62 and days_in(store, key) < end.day
+
+
+def run_era5(store, minutes: float, years=None, log=print, today: date | None = None) -> int:
     """Request missing ERA5-Land months one after the other (CDS rules: sequential), newest first."""
     import cdsapi
 
     client = cdsapi.Client(url=CDS_URL, key=os.environ["CDS_API_KEY"], quiet=True, progress=False)
     stop = time.monotonic() + minutes * 60
     have = set(store.list("climate/era5land/eu/"))
-    today = date.today()
-    last = date(today.year, today.month, 1) - timedelta(days=1)  # ERA5-Land runs a few days behind: last month
+    today = today or date.today()
+    last = date(today.year, today.month, 1)  # the running month too: era5_due asks only its rain
     done = failed = 0
     for year, month in months_newest_first(ERA5_FIRST_YEAR, last, years):
         for var, dataset, request in era5_requests(year, month):
             key = key_of("era5land", var, year, month)
-            if key in have:
+            if not era5_due(store, key, var, year, month, have, today):
                 continue
             if time.monotonic() > stop:
                 return done

@@ -200,3 +200,35 @@ def test_world_waits_until_europe_is_complete(tmp_path, monkeypatch):
     for v in climate.VARS:
         store.put(climate.key_of("era5land", v, climate.ERA5_FIRST_YEAR, 1), b"x")
     assert climate.europe_complete(store)
+
+
+def test_era5_completes_a_short_recent_month_and_asks_the_next_months_rain(tmp_path, monkeypatch):
+    # 5 Nov 2026: October was fetched on 1 Nov, ended on the 26th and was never completed, so the season could not be
+    # computed; the rain of 31 Oct is in the November file (its 00 UTC step on the 1st)
+    store = LocalStore(tmp_path)
+    days = {"2026-10": 26, "2026-09": 30}
+    for ym, n in days.items():
+        for v in climate.VARS:
+            store.put(climate.key_of("era5land", v, int(ym[:4]), int(ym[5:])), f"{n}".encode())
+    monkeypatch.setattr(climate, "days_in", lambda s, key: int(s.get(key)))
+    have = set(store.list("climate/era5land/eu/"))
+
+    def due(var, y, m, today):
+        return climate.era5_due(store, climate.key_of("era5land", var, y, m), var, y, m, have, today)
+
+    # too early: the last days are not there yet
+    assert not due("tx", 2026, 10, date(2026, 11, 5))
+    assert not due("rr", 2026, 11, date(2026, 11, 5))
+    # then the short month again, the complete one not, and of the running month only the rain, once
+    assert due("tx", 2026, 10, date(2026, 11, 6))
+    assert not due("tx", 2026, 9, date(2026, 11, 6))
+    assert due("rr", 2026, 11, date(2026, 11, 7))
+    assert not due("tx", 2026, 11, date(2026, 11, 7))
+    have.add(climate.key_of("era5land", "rr", 2026, 11))
+    assert not due("rr", 2026, 11, date(2026, 11, 20))
+    # a month that is still missing is asked as before; an old short month is left alone
+    assert due("tx", 2026, 8, date(2026, 11, 6))
+    assert not due("tx", 2026, 9, date(2027, 3, 1))
+    # the finished November comes in full in December
+    store.put(climate.key_of("era5land", "rr", 2026, 11), b"7")
+    assert due("rr", 2026, 11, date(2026, 12, 6))
