@@ -87,13 +87,20 @@ def test_supabase_down_is_a_problem_until_it_answers_again(tmp_path):
 
 def test_each_backup_is_watched_on_its_own():
     st = {"sites": {}, "data": {}, "jobs_failing": {}, "plan": {}}
-    fresh = {"ok": True, "laptop": {"last": "2026-10-24T12:00:00Z"}, "cloud": {"last": "2026-10-25T02:40:00Z"}}
+    fresh = {
+        "ok": True,
+        "laptop": {"last": "2026-10-24T12:00:00Z"},
+        "cloud": {"last": "2026-10-25T02:40:00Z"},
+        "database": {"last": "2026-10-25T02:05:00Z"},
+    }
     assert health.problems({**st, "backup": fresh}, NOW) == {}
     laptop_off = {**fresh, "laptop": {"last": "2026-10-20T12:00:00Z"}}
     got = health.problems({**st, "backup": laptop_off}, NOW)
     assert list(got) == ["backup:laptop"] and "5 days old" in got["backup:laptop"]
     no_cloud = {**fresh, "cloud": {"last": None}}
     assert "missing" in health.problems({**st, "backup": no_cloud}, NOW)["backup:cloud"]
+    no_db = {**fresh, "database": {"last": None}}
+    assert "Database backup job" in health.problems({**st, "backup": no_db}, NOW)["backup:database"]
     assert "failed" in health.problems({**st, "backup": {"ok": False, "detail": "x"}}, NOW)["backup"]
     assert health.problems(st, NOW) == {}  # not configured: no alarm
 
@@ -215,3 +222,10 @@ def test_site_check_knows_the_new_name(monkeypatch):
     ):
         monkeypatch.setattr(health.urllib.request, "urlopen", lambda req, timeout=0, b=body: Page(b))
         assert health.check_site("https://x", {})["ok"] is ok
+
+
+def test_backup_kinds_by_name():
+    assert health.backup_kind("daily/winemap-db-live-2026-11-07-0200.7z") == "database"
+    assert health.backup_kind("daily/winemap-db-staging-2026-11-07-1154.7z") is None  # by hand, not watched
+    assert health.backup_kind("daily/winemap-cloud-2026-11-07-0328.7z") == "cloud"
+    assert health.backup_kind("daily/winemap-2026-11-07-1300.7z") == "laptop"
