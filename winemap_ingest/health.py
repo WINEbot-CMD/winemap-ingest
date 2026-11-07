@@ -36,8 +36,9 @@ STATUS = "https://vinecontext.com/api/status"  # live: it has the secrets for th
 QUOTA_ALERT = 0.8
 INGEST_RUNS = "https://api.github.com/repos/WINEbot-CMD/winemap-ingest/actions/runs?per_page=30"
 NOWCAST_LATE = timedelta(minutes=45)
-# the two daily backups (winemap-nl docs/30): the laptop's and the nightly cloud one, each watched on its own
-BACKUP_LATE = {"laptop": timedelta(days=3), "cloud": timedelta(days=2)}
+# the daily backups (winemap-nl docs/30), each watched on its own: the laptop's, the nightly cloud one (code) and the
+# nightly copy of the live database (winemap-compute db_backup, 7 Nov 2026); staging copies (by hand) are not watched
+BACKUP_LATE = {"laptop": timedelta(days=3), "cloud": timedelta(days=2), "database": timedelta(days=2)}
 RAIN_LATE = timedelta(hours=12)  # the hourly job catches up slowly while the KNMI limit is shared
 # PowerSync keep-alive (winemap-nl docs/39): once a day is plenty (the free plan stops after 1-2 weeks); a warning
 # when it has not worked for this long, well before the instance would stop
@@ -174,6 +175,16 @@ def check_nowcast_path(site: str, headers: dict[str, str]) -> dict:
         return {"ok": False, "detail": str(e)[:160], "age_min": None}
 
 
+def backup_kind(key: str) -> str | None:
+    """Which backup an archive in daily/ is: laptop, cloud (code), database (live); None for staging copies."""
+    name = key.removeprefix("daily/")
+    if name.startswith("winemap-db-live-"):
+        return "database"
+    if name.startswith("winemap-db-"):
+        return None
+    return "cloud" if name.startswith("winemap-cloud-") else "laptop"
+
+
 def check_backup(account: str, key_id: str, secret: str, client=None) -> dict:
     """The newest daily backup of the laptop (winemap-YYYY-...) and of the cloud job (winemap-cloud-...) in the
     private bucket `winemap-backup`, with a read-only key (winemap-nl docs/30)."""
@@ -191,7 +202,9 @@ def check_backup(account: str, key_id: str, secret: str, client=None) -> dict:
         newest: dict[str, dict] = {}
         for page in client.get_paginator("list_objects_v2").paginate(Bucket="winemap-backup", Prefix="daily/"):
             for o in page.get("Contents", []):
-                kind = "cloud" if o["Key"].startswith("daily/winemap-cloud-") else "laptop"
+                kind = backup_kind(o["Key"])
+                if kind is None:
+                    continue
                 if kind not in newest or o["LastModified"] > newest[kind]["LastModified"]:
                     newest[kind] = o
     except Exception as e:  # noqa: BLE001
@@ -293,7 +306,11 @@ def problems(state: dict, now: datetime) -> dict[str, str]:
             last = _parse((bk.get(kind) or {}).get("last"))
             if last is None or now - last > late:
                 age = f"{(now - last).days} days old" if last else "missing"
-                why = "is the laptop off or its task broken?" if kind == "laptop" else "see the Cloud backup job"
+                why = {
+                    "laptop": "is the laptop off or its task broken?",
+                    "cloud": "see the Cloud backup job",
+                    "database": "see the Database backup job in winemap-compute",
+                }[kind]
                 out[f"backup:{kind}"] = f"The newest {kind} backup in R2 is {age} - {why} (docs/30)"
     nc = _parse(state["data"].get("nowcast"))
     if nc and now - nc > NOWCAST_LATE:
