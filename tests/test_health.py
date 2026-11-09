@@ -229,3 +229,75 @@ def test_backup_kinds_by_name():
     assert health.backup_kind("daily/winemap-db-staging-2026-11-07-1154.7z") is None  # by hand, not watched
     assert health.backup_kind("daily/winemap-cloud-2026-11-07-0328.7z") == "cloud"
     assert health.backup_kind("daily/winemap-2026-11-07-1300.7z") == "laptop"
+
+
+class _Answer:
+    """What urlopen gives back: a JSON body, or the lines of a sync stream."""
+
+    def __init__(self, body=None, lines=()):
+        self.body, self.lines = body, lines
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self):
+        return json.dumps(self.body).encode()
+
+    def __iter__(self):
+        return iter(self.lines)
+
+
+def _auth_server(monkeypatch):
+    """A fake Supabase auth: every renewal hands out the next refresh token. Returns the bodies it received."""
+    seen = []
+
+    def urlopen(req, timeout=None):
+        body = json.loads(req.data)
+        seen.append((req.full_url, body))
+        return _Answer({"access_token": "access", "refresh_token": f"next-{len(seen)}"})
+
+    monkeypatch.setattr(health.urllib.request, "urlopen", urlopen)
+    return seen
+
+
+def test_password_sign_in_sends_the_captcha_test_token(monkeypatch):
+    seen = _auth_server(monkeypatch)
+    assert health.password_token("https://sb", "key", "a@example.invalid", "pw") == "access"
+    url, body = seen[0]
+    assert "grant_type=password" in url
+    assert body["gotrue_meta_security"]["captcha_token"] == health.CAPTCHA_TEST_TOKEN
+
+
+def test_renewal_starts_from_the_seed_then_uses_the_saved_token(monkeypatch, tmp_path):
+    seen = _auth_server(monkeypatch)
+    store = LocalStore(tmp_path)
+    assert health.renewed_token("https://sb", "key", "seed", store) == "access"
+    health.renewed_token("https://sb", "key", "seed", store)
+    assert "grant_type=refresh_token" in seen[0][0]
+    assert [b["refresh_token"] for _, b in seen] == ["seed", "next-1"]
+
+
+def test_a_new_seed_replaces_the_saved_token(monkeypatch, tmp_path):
+    seen = _auth_server(monkeypatch)
+    store = LocalStore(tmp_path)
+    health.renewed_token("https://sb", "key", "seed", store)
+    health.renewed_token("https://sb", "key", "second seed", store)
+    assert [b["refresh_token"] for _, b in seen] == ["seed", "second seed"]
+
+
+def test_the_saved_token_is_not_kept_as_plain_seed(monkeypatch, tmp_path):
+    _auth_server(monkeypatch)
+    store = LocalStore(tmp_path)
+    health.renewed_token("https://sb", "key", "my seed", store)
+    assert b"my seed" not in store.get(health.LIVE_SESSION)
+
+
+def test_check_powersync_reports_a_failed_sign_in_without_syncing(monkeypatch):
+    def refused():
+        raise OSError("HTTP Error 400: Bad Request")
+
+    r = health.check_powersync("https://ps", refused)
+    assert r["ok"] is False and "400" in r["detail"]
