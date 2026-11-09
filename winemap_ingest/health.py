@@ -15,6 +15,7 @@ winemap-nl docs/39)
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -22,7 +23,7 @@ import urllib.request
 from datetime import UTC, datetime, timedelta
 
 from .knmi import API
-from .store import open_store
+from .store import R2Store, open_store
 
 # the home page: every version of the site has it (the /api routes only exist after the monitoring release)
 SITES = {
@@ -62,11 +63,17 @@ POWERSYNC_TARGETS = {
             "POWERSYNC_LIVE_URL",
             "SUPABASE_URL",
             "SUPABASE_PUBLISHABLE_KEY",
-            "KEEPALIVE_LIVE_EMAIL",
-            "KEEPALIVE_LIVE_PASSWORD",
+            "KEEPALIVE_LIVE_REFRESH_TOKEN",
+            "R2_CLIMATE_ACCESS_KEY_ID",
         ),
     ),
 }
+
+
+# staging's CAPTCHA uses Cloudflare's test secret, which accepts this dummy token (winemap-nl #225); live's does not
+CAPTCHA_TEST_TOKEN = "XXXX.DUMMY.TOKEN.XXXX"
+# in the private climate bucket: everything in winemap-wx can be read by anyone through the site's /wx/ route
+LIVE_SESSION = "keepalive/powersync_live_session.json"
 
 
 def _iso(t: datetime) -> str:
@@ -118,19 +125,59 @@ def check_supabase(url: str, key: str) -> dict:
     return {"ok": ok, "ms": round((time.monotonic() - t0) * 1000), "detail": detail}
 
 
-def check_powersync(ps_url: str, sb_url: str, sb_key: str, email: str, password: str) -> dict:
-    """PowerSync keep-alive: sign in as the keep-alive account (staging database) and open a sync stream until its
-    first checkpoint - real use of the instance, so the free plan does not stop it."""
+def _grant(sb_url: str, sb_key: str, grant: str, body: dict) -> dict:
+    req = urllib.request.Request(
+        f"{sb_url.rstrip('/')}/auth/v1/token?grant_type={grant}",
+        data=json.dumps(body).encode(),
+        headers={"apikey": sb_key, "Content-Type": "application/json", "User-Agent": "winemap-health"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())
+
+
+def password_token(sb_url: str, sb_key: str, email: str, password: str) -> str:
+    """Staging: an ordinary sign-in, with the test token its CAPTCHA accepts."""
+    body = {"email": email, "password": password, "gotrue_meta_security": {"captcha_token": CAPTCHA_TEST_TOKEN}}
+    return _grant(sb_url, sb_key, "password", body)["access_token"]
+
+
+def renewed_token(sb_url: str, sb_key: str, seed: str, store) -> str:
+    """Live: a password sign-in needs a real CAPTCHA, renewing a session does not. Each renewal gives a new refresh
+    token, kept in `store`; the seed (one sign-in by hand, GitHub secret) is used again only when it is a new one."""
+    seed_id = hashlib.sha256(seed.encode()).hexdigest()
+    raw = store.get(LIVE_SESSION)
+    saved = json.loads(raw) if raw else {}
+    token = saved["token"] if saved.get("seed") == seed_id else seed
+    session = _grant(sb_url, sb_key, "refresh_token", {"refresh_token": token})
+    kept = json.dumps({"seed": seed_id, "token": session["refresh_token"]}).encode()
+    store.put(LIVE_SESSION, kept, "application/json")
+    return session["access_token"]
+
+
+def _sign_in(key: str, env):
+    """How the keep-alive of this instance gets its access token."""
+    if key == "powersync_live":
+        return lambda: renewed_token(
+            env["SUPABASE_URL"],
+            env["SUPABASE_PUBLISHABLE_KEY"],
+            env["KEEPALIVE_LIVE_REFRESH_TOKEN"],
+            R2Store(bucket=env.get("R2_CLIMATE_BUCKET", "winemap-climate"), creds="R2_CLIMATE"),
+        )
+    return lambda: password_token(
+        env["SUPABASE_STAGING_URL"],
+        env["SUPABASE_STAGING_PUBLISHABLE_KEY"],
+        env["KEEPALIVE_EMAIL"],
+        env["KEEPALIVE_PASSWORD"],
+    )
+
+
+def check_powersync(ps_url: str, sign_in) -> dict:
+    """PowerSync keep-alive: sign in as the keep-alive account and open a sync stream until its first checkpoint -
+    real use of the instance, so the free plan does not stop it."""
     t0 = time.monotonic()
     try:
-        req = urllib.request.Request(
-            f"{sb_url.rstrip('/')}/auth/v1/token?grant_type=password",
-            data=json.dumps({"email": email, "password": password}).encode(),
-            headers={"apikey": sb_key, "Content-Type": "application/json", "User-Agent": "winemap-health"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=20) as r:
-            token = json.loads(r.read())["access_token"]
+        token = sign_in()
         req = urllib.request.Request(
             f"{ps_url.rstrip('/')}/sync/stream",
             data=json.dumps({"buckets": [], "include_checksum": True, "raw_data": True}).encode(),
@@ -405,7 +452,7 @@ def run(
         prev_ps = old.get(key) or {}
         due = (_parse(prev_ps.get("checked")) or datetime.min.replace(tzinfo=UTC)) <= now - POWERSYNC_EVERY
         if given is None and due and all(env.get(k) for k in keys):
-            given = check_powersync(*(env[k] for k in keys))
+            given = check_powersync(env[keys[0]], _sign_in(key, env))
         if given:
             given["checked"] = _iso(now)
             given["last_ok"] = _iso(now) if given["ok"] else prev_ps.get("last_ok")
