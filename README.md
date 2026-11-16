@@ -63,3 +63,19 @@ Europe (0.1°) -> one int16 NetCDF per variable per month in the private R2 buck
 stopped. Secrets: `KNMI_DOWNLOAD_KEY` (the download key, not the rain jobs' key), `CDS_API_KEY`,
 `R2_CLIMATE_ACCESS_KEY_ID`, `R2_CLIMATE_SECRET_ACCESS_KEY` (+ `R2_ACCOUNT_ID`). The laptop's own downloads go in with
 `python -m winemap_ingest.climate pack-knmi|pack-era5 <raw dir> <years>`.
+
+## Live PowerSync keep-alive: a new start token
+
+Live sign-ins need a real CAPTCHA, so the daily keep-alive renews a saved session instead (`health.renewed_token`).
+When the status page / ntfy says **"live session ended ... a new KEEPALIVE_LIVE_REFRESH_TOKEN is needed"**, give it a
+new start token, once:
+
+1. Open a **private (incognito) window** at https://app.vinecontext.com and sign in as the keep-alive account
+   (`KEEPALIVE_LIVE_EMAIL` / `KEEPALIVE_LIVE_PASSWORD`).
+2. F12 → Console, paste (copies the token to the clipboard without showing it):
+   `copy(JSON.parse(localStorage.getItem(Object.keys(localStorage).find(k => k.endsWith('-auth-token')))).refresh_token)`
+3. **Close the window without signing out.** Signing out ends the session; an open window keeps renewing it itself,
+   and a token renewed in two places ends the session too (that is what broke it in Nov 2026).
+4. `gh secret set KEEPALIVE_LIVE_REFRESH_TOKEN -R WINEbot-CMD/winemap-ingest` and paste the token.
+
+The next daily try sees a new seed and continues from it. Never use the keep-alive account in an ordinary browser.
