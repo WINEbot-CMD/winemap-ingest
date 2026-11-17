@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import time
+import urllib.error
 import urllib.request
 from datetime import UTC, datetime, timedelta
 
@@ -74,6 +75,12 @@ POWERSYNC_TARGETS = {
 CAPTCHA_TEST_TOKEN = "XXXX.DUMMY.TOKEN.XXXX"
 # in the private climate bucket: everything in winemap-wx can be read by anyone through the site's /wx/ route
 LIVE_SESSION = "keepalive/powersync_live_session.json"
+STORE_TRIES = 4  # keeping the renewed session token: tries, with 2, 4, 6 s between them
+STORE_WAIT_S = 2
+
+
+class SessionEnded(RuntimeError):
+    """The live keep-alive's saved session is no longer accepted: only a new seed (a sign-in by hand) helps."""
 
 
 def _iso(t: datetime) -> str:
@@ -149,9 +156,25 @@ def renewed_token(sb_url: str, sb_key: str, seed: str, store) -> str:
     raw = store.get(LIVE_SESSION)
     saved = json.loads(raw) if raw else {}
     token = saved["token"] if saved.get("seed") == seed_id else seed
-    session = _grant(sb_url, sb_key, "refresh_token", {"refresh_token": token})
+    try:
+        session = _grant(sb_url, sb_key, "refresh_token", {"refresh_token": token})
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 401, 403):
+            # the session was ended (signed out, or its token used elsewhere): it does not come back by itself
+            raise SessionEnded(
+                f"live session ended (HTTP {e.code}): a new KEEPALIVE_LIVE_REFRESH_TOKEN is needed, see the README"
+            ) from e
+        raise
     kept = json.dumps({"seed": seed_id, "token": session["refresh_token"]}).encode()
-    store.put(LIVE_SESSION, kept, "application/json")
+    # the old token is spent now: losing the new one would end the session, so keep it even if R2 hiccups
+    for attempt in range(STORE_TRIES):
+        try:
+            store.put(LIVE_SESSION, kept, "application/json")
+            break
+        except Exception:
+            if attempt == STORE_TRIES - 1:
+                raise
+            time.sleep(STORE_WAIT_S * (attempt + 1))
     return session["access_token"]
 
 

@@ -301,3 +301,34 @@ def test_check_powersync_reports_a_failed_sign_in_without_syncing(monkeypatch):
 
     r = health.check_powersync("https://ps", refused)
     assert r["ok"] is False and "400" in r["detail"]
+
+
+def test_an_ended_session_says_a_new_seed_is_needed(monkeypatch, tmp_path):
+    import io
+    import urllib.error
+
+    def urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {}, io.BytesIO(b"{}"))
+
+    monkeypatch.setattr(health.urllib.request, "urlopen", urlopen)
+    sign_in = lambda: health.renewed_token("https://sb", "key", "seed", LocalStore(tmp_path))  # noqa: E731
+    r = health.check_powersync("https://ps", sign_in)
+    assert r["ok"] is False
+    assert "KEEPALIVE_LIVE_REFRESH_TOKEN" in r["detail"] and "README" in r["detail"]
+
+
+def test_the_renewed_token_is_kept_even_when_the_store_fails_once(monkeypatch, tmp_path):
+    _auth_server(monkeypatch)
+    monkeypatch.setattr(health, "STORE_WAIT_S", 0)
+    store = LocalStore(tmp_path)
+    real_put, fails = store.put, []
+
+    def flaky_put(*a, **k):
+        if not fails:
+            fails.append(1)
+            raise OSError("R2 hiccup")
+        return real_put(*a, **k)
+
+    store.put = flaky_put
+    health.renewed_token("https://sb", "key", "seed", store)
+    assert json.loads(store.get(health.LIVE_SESSION))["token"] == "next-1"
