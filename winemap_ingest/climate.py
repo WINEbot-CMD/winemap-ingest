@@ -437,7 +437,7 @@ def run_era5_world(
 
     done = failed = 0
     jobs = iter(todo)
-    waiting: dict = {}  # remote -> job
+    waiting: list = []  # [remote, job]; a Remote cannot be a dict key (not hashable)
     try:
         while failed < 5 and time.monotonic() < hard:
             while len(waiting) < queue and time.monotonic() < stop:
@@ -448,7 +448,7 @@ def run_era5_world(
                 box = world_box(WORLD_AREAS[r] for r in regions)
                 _, dataset, request = next(r for r in era5_requests(year, month, box) if r[0] == var)
                 try:
-                    waiting[client.submit(dataset, request)] = job
+                    waiting.append((client.submit(dataset, request), job))
                 except Exception as e:  # noqa: BLE001
                     failed += 1
                     log(f"FAILED to ask {var} {year}-{month:02d}: {e}")
@@ -456,13 +456,14 @@ def run_era5_world(
             if not waiting:
                 break
             moved = False
-            for remote, job in list(waiting.items()):
+            for item in list(waiting):
+                remote, job = item
                 status = remote.status
                 if status == "accepted" and time.monotonic() >= stop:  # time is up: withdraw what has not started
                     remote.delete()
-                    del waiting[remote]
+                    waiting.remove(item)
                 elif status == "successful":
-                    del waiting[remote]
+                    waiting.remove(item)
                     moved = True
                     try:
                         log(f"ok {save(remote, job)}")
@@ -471,13 +472,13 @@ def run_era5_world(
                         failed += 1
                         log(f"FAILED {job[0]} {job[1]}-{job[2]:02d}: {e}")
                 elif status in ("failed", "rejected", "dismissed", "deleted"):
-                    del waiting[remote]
+                    waiting.remove(item)
                     failed += 1
                     log(f"FAILED {job[0]} {job[1]}-{job[2]:02d}: CDS says {status}")
             if not moved and waiting:
                 time.sleep(poll)
     finally:
-        for remote in waiting:  # nothing left behind in CDS's queue
+        for remote, _ in waiting:  # nothing left behind in CDS's queue
             try:
                 remote.delete()
             except Exception:  # noqa: BLE001, S110
