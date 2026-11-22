@@ -138,47 +138,94 @@ def test_latest_version_per_day():
     assert climate.latest_per_day([b, c, a]) == [b, c]
 
 
-def test_world_download_a_year_per_request_split_into_months(tmp_path, monkeypatch):
-    import sys
-    import threading
-    import types
+class FakeRemote:
+    def __init__(self, request, plan):
+        self.request, self.plan, self.deleted = request, list(plan), False
 
+    @property
+    def status(self):
+        return self.plan.pop(0) if len(self.plan) > 1 else self.plan[0]
+
+    def download(self, path):
+        open(path, "wb").write(b"nc")
+
+    def delete(self):
+        self.deleted = True
+
+
+class FakeClient:
+    def __init__(self, plan=("accepted", "running", "successful")):
+        self.plan, self.remotes = plan, []
+
+    def submit(self, dataset, request):
+        self.remotes.append(FakeRemote(request, self.plan))
+        return self.remotes[-1]
+
+
+def test_world_download_a_month_per_request_for_the_box_around_the_missing_areas(tmp_path, monkeypatch):
     store = LocalStore(tmp_path)
     store.put(climate.world_key("oc", "tg", 2024, 12), b"done")  # already there: not asked again
-    seen, live, peak = [], [0], [0]
-    lock = threading.Lock()
-
-    class Client:
-        def __init__(self, **kw):
-            pass
-
-        def retrieve(self, dataset, request):
-            with lock:
-                live[0] += 1
-                peak[0] = max(peak[0], live[0])
-                seen.append((request["year"], tuple(request["month"]), tuple(request["area"])))
-
-            class Result:
-                def download(self, path):
-                    open(path, "wb").write(b"nc")
-                    with lock:
-                        live[0] -= 1
-
-            return Result()
-
-    monkeypatch.setitem(sys.modules, "cdsapi", types.SimpleNamespace(Client=Client))
-    monkeypatch.setattr(climate, "era5_pack_months", lambda var, raw: {(2024, m): b"packed" for m in range(1, 13)})
-    monkeypatch.setenv("CDS_API_KEY", "x")
-    n = climate.run_era5_world(
-        store, minutes=5, years=(2024, 2024), parallel=3, log=lambda *_: None, after_europe=False
+    monkeypatch.setattr(
+        climate, "era5_cut_areas", lambda var, raw, areas: {r: {(2024, 12): b"packed", (2025, 1): b"x"} for r in areas}
     )
-    assert n == len(climate.VARS) * len(climate.WORLD_AREAS)  # one request per area and variable for the year
-    assert {a for _, _, a in seen} == {tuple(a) for a in climate.WORLD_AREAS.values()}
-    oc = climate.WORLD_AREAS["oc"]
-    assert any(len(m) == 11 for _, m, a in seen if a == tuple(oc))  # oc tg: December was there
-    assert peak[0] <= 3
-    assert store.get(climate.world_key("na", "rr", 2024, 1)) == b"packed"
+    client = FakeClient()
+    n = climate.run_era5_world(
+        store, minutes=5, years=(2024, 2024), queue=3, log=lambda *_: None, after_europe=False, client=client, poll=0
+    )
+    seen = [(tuple(r.request["month"]), tuple(r.request["area"]), r.request["variable"][0]) for r in client.remotes]
+    assert n == len(seen) == len(climate.VARS) * 12  # one request per variable and month, every area in it
+    assert all(len(m) == 1 for m, _, _ in seen)
+    full = tuple(climate.world_box(climate.WORLD_AREAS.values()))
+    assert full == (62.0, -170.0, -56.0, 180.0)
+    assert all(a == full for m, a, _ in seen if m != ("12",))
+    # December's tg: oc was there, so the box of the other four (and only the asked month is stored)
+    others = tuple(climate.world_box(x for r, x in climate.WORLD_AREAS.items() if r != "oc"))
+    assert (("12",), others, "2m_temperature") in seen
+    assert store.get(climate.world_key("na", "rr", 2024, 12)) == b"packed"
     assert store.get(climate.world_key("oc", "tg", 2024, 12)) == b"done"  # not overwritten
+    assert store.get(climate.world_key("na", "rr", 2025, 1)) is None
+
+
+def test_world_leaves_nothing_in_the_cds_queue_when_the_time_is_up(tmp_path):
+    client = FakeClient(plan=("accepted",))  # CDS never starts them
+    n = climate.run_era5_world(
+        LocalStore(tmp_path),
+        0.001,
+        years=(2024, 2024),
+        queue=4,
+        log=lambda *_: None,
+        after_europe=False,
+        client=client,
+        poll=0.01,
+    )
+    assert n == 0 and len(client.remotes) == 4 and all(r.deleted for r in client.remotes)
+
+
+def test_world_stops_after_five_failures(tmp_path):
+    client = FakeClient(plan=("failed",))
+    n = climate.run_era5_world(
+        LocalStore(tmp_path),
+        5,
+        years=(2024, 2024),
+        queue=2,
+        log=lambda *_: None,
+        after_europe=False,
+        client=client,
+        poll=0,
+    )
+    assert n == 0 and len(client.remotes) <= 6
+
+
+def test_a_box_cut_into_areas_is_packed_as_the_areas_asked_alone():
+    v = np.arange(3 * 2 * 2, dtype="f4").reshape(3, 2, 2) + 280.0  # lat 52.0, 51.9 x lon 5.0, 5.1
+    box = era5_file("tn", date(2026, 3, 1), 3, v)
+    parts = climate.era5_cut_areas("tn", box, {"w": [52.0, 5.0, 51.9, 5.0], "ne": [52.0, 5.1, 52.0, 5.1]})
+    t_w, a_w = read(parts["w"][(2026, 3)], "tn")
+    t_ne, a_ne = read(parts["ne"][(2026, 3)], "tn")
+    _, a_all = read(climate.era5_pack("tn", box), "tn")
+    assert a_w.shape == (3, 2, 1) and a_ne.shape == (3, 1, 1)
+    assert np.allclose(a_w, a_all[:, :, :1]) and np.allclose(a_ne, a_all[:, :1, 1:])
+    assert t_w == t_ne
 
 
 def test_a_year_split_into_months_is_packed_as_months_asked_alone():
