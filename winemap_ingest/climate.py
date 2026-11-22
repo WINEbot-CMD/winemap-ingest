@@ -385,6 +385,9 @@ def world_box(areas) -> list[float]:
     return [max(x[0] for x in a), min(x[1] for x in a), min(x[2] for x in a), max(x[3] for x in a)]
 
 
+WORLD_PENDING = "state/era5land_world_pending.json"  # the requests still waiting in CDS's queue, for the next run
+
+
 def run_era5_world(
     store, minutes: float, years=None, queue: int = 10, log=print, after_europe: bool = True, client=None, poll=30.0
 ) -> int:
@@ -392,10 +395,11 @@ def run_era5_world(
     around every area still missing it, cut into the areas here.
 
     A month at a time: CDS puts a request of more months in its queue for large requests (22 Nov 2026: 1,419
-    waiting; none of our year requests started in four runs of 5.7 h). A month waits about an hour in the normal
-    queue (~2,000 requests, 60 running) and then runs in minutes, and our account runs one at a time; so up to
-    `queue` requests wait in CDS's queue at once. When the time is up, the ones not started yet are withdrawn, and
-    whatever is left when the run ends is deleted: nothing stays behind in CDS's queue. Stops after 5 failures."""
+    waiting; none of our year requests started in four runs of 5.7 h). The temperature months wait in the normal
+    daily-statistics queue (22 Nov: ~2,250 waiting, 60 running; none of ours started within an hour), the rain runs
+    in minutes. So up to `queue` requests wait in CDS's queue at once, and the ones still waiting when a run ends
+    are written to WORLD_PENDING and picked up by the next run: their place in the queue is kept, not given up.
+    Stops after 5 failures."""
     # Jasper, 1 Nov 2026: "Europe first": the world waits until Europe's history is in (one CDS queue for both)
     if after_europe and not europe_complete(store):
         log("Europe's ERA5-Land history is not complete yet: the world waits")
@@ -406,7 +410,6 @@ def run_era5_world(
         client = Client(url=CDS_URL, key=os.environ["CDS_API_KEY"], progress=False, maximum_tries=5)
 
     stop = time.monotonic() + minutes * 60
-    hard = stop + 15 * 60  # the job's own limit is 25 minutes later
     have = set()
     for region in WORLD_AREAS:
         have |= set(store.list(f"climate/era5land/{region}/"))
@@ -422,7 +425,22 @@ def run_era5_world(
                 missing = [r for r in WORLD_AREAS if world_key(r, var, year, month) not in have]
                 if missing:
                     todo.append((var, year, month, missing))
-    log(f"{len(todo)} world requests to go (a month and variable each)")
+
+    waiting: list = []  # [remote, job]; a Remote cannot be a dict key (not hashable)
+    raw = store.get(WORLD_PENDING)
+    for item in json.loads(raw) if raw else []:
+        job = (item["var"], item["year"], item["month"], item["regions"])
+        try:
+            waiting.append((client.get_remote(item["id"]), job))
+        except Exception as e:  # noqa: BLE001
+            log(f"a waiting request is gone ({job[0]} {job[1]}-{job[2]:02d}): {e}")
+    taken = {(v, y, m) for _, (v, y, m, _) in waiting}
+    todo = [j for j in todo if (j[0], j[1], j[2]) not in taken]
+    log(f"{len(todo)} world requests to go (a month and variable each), {len(waiting)} waiting in CDS's queue")
+
+    def remember() -> None:  # after every change, so a run cut off by the job's time limit loses nothing
+        items = [{"id": r.request_id, "var": v, "year": y, "month": m, "regions": g} for r, (v, y, m, g) in waiting]
+        store.put(WORLD_PENDING, json.dumps(items).encode(), "application/json")
 
     def save(remote, job) -> str:
         var, year, month, regions = job
@@ -437,53 +455,53 @@ def run_era5_world(
 
     done = failed = 0
     jobs = iter(todo)
-    waiting: list = []  # [remote, job]; a Remote cannot be a dict key (not hashable)
-    try:
-        while failed < 5 and time.monotonic() < hard:
-            while len(waiting) < queue and time.monotonic() < stop:
-                job = next(jobs, None)
-                if job is None:
-                    break
-                var, year, month, regions = job
-                box = world_box(WORLD_AREAS[r] for r in regions)
-                _, dataset, request = next(r for r in era5_requests(year, month, box) if r[0] == var)
+    while failed < 5 and time.monotonic() < stop:
+        asked = False
+        while len(waiting) < queue:
+            job = next(jobs, None)
+            if job is None:
+                break
+            var, year, month, regions = job
+            box = world_box(WORLD_AREAS[r] for r in regions)
+            _, dataset, request = next(r for r in era5_requests(year, month, box) if r[0] == var)
+            try:
+                waiting.append((client.submit(dataset, request), job))
+                asked = True
+            except Exception as e:  # noqa: BLE001
+                failed += 1
+                log(f"FAILED to ask {var} {year}-{month:02d}: {e}")
+                break
+        if asked:
+            remember()
+        if not waiting:
+            break
+        moved = False
+        for item in list(waiting):
+            remote, job = item
+            try:
+                status = remote.status
+            except Exception as e:  # noqa: BLE001
+                status = f"unreadable ({e})"
+            if status == "successful":
+                waiting.remove(item)
+                moved = True
                 try:
-                    waiting.append((client.submit(dataset, request), job))
+                    log(f"ok {save(remote, job)}")
+                    done += 1
                 except Exception as e:  # noqa: BLE001
                     failed += 1
-                    log(f"FAILED to ask {var} {year}-{month:02d}: {e}")
-                    break
-            if not waiting:
-                break
-            moved = False
-            for item in list(waiting):
-                remote, job = item
-                status = remote.status
-                if status == "accepted" and time.monotonic() >= stop:  # time is up: withdraw what has not started
-                    remote.delete()
-                    waiting.remove(item)
-                elif status == "successful":
-                    waiting.remove(item)
-                    moved = True
-                    try:
-                        log(f"ok {save(remote, job)}")
-                        done += 1
-                    except Exception as e:  # noqa: BLE001
-                        failed += 1
-                        log(f"FAILED {job[0]} {job[1]}-{job[2]:02d}: {e}")
-                elif status in ("failed", "rejected", "dismissed", "deleted"):
-                    waiting.remove(item)
-                    failed += 1
-                    log(f"FAILED {job[0]} {job[1]}-{job[2]:02d}: CDS says {status}")
-            if not moved and waiting:
-                time.sleep(poll)
-    finally:
-        for remote, _ in waiting:  # nothing left behind in CDS's queue
-            try:
-                remote.delete()
-            except Exception:  # noqa: BLE001, S110
-                pass
-    log(f"{done} world months stored, {len(todo) - done} to go")
+                    log(f"FAILED {job[0]} {job[1]}-{job[2]:02d}: {e}")
+            elif status not in ("accepted", "running"):
+                waiting.remove(item)
+                moved = True
+                failed += 1
+                log(f"FAILED {job[0]} {job[1]}-{job[2]:02d}: CDS says {status}")
+        if moved:
+            remember()
+        elif waiting:
+            time.sleep(poll)
+    remember()
+    log(f"{done} world months stored, {len(waiting)} waiting in CDS's queue for the next run")
     return done
 
 
