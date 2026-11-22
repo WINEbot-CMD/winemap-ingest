@@ -13,7 +13,7 @@ last day of the previous month up to the second-last day of its month; the BCI s
 Runs (GitHub Actions in this repo, or on the laptop with a folder as the store):
     python -m winemap_ingest.climate knmi [--years 2024 1961] [--minutes 50]
     python -m winemap_ingest.climate era5 [--years 2025 1961] [--minutes 320]
-    python -m winemap_ingest.climate era5-world [--years 2025 1991] [--minutes 320] [--parallel 3]   # wine belts
+    python -m winemap_ingest.climate era5-world [--years 2025 1991] [--minutes 320] [--queue 10]   # wine belts
     python -m winemap_ingest.climate pack-knmi <raw dir> <year> [<year> ...]     # the laptop's KNMI files
     python -m winemap_ingest.climate pack-era5 <raw dir> <year> [<year> ...]     # the laptop's ERA5 files
 Each run picks up what is missing in the store, newest first, until its time or the request limit is used up.
@@ -273,9 +273,26 @@ def era5_pack(var: str, raw: bytes) -> bytes:
 
 
 def era5_pack_months(var: str, raw: bytes) -> dict[tuple[int, int], bytes]:
-    """A CDS file of several months (the world asks a year at a time) -> our month files, each packed exactly as a
-    month asked on its own (split on the month of the time steps, before the rain moves a day back)."""
+    """A CDS file of several months -> our month files, each packed exactly as a month asked on its own (split on
+    the month of the time steps, before the rain moves a day back)."""
+    return _pack_by_month(var, *era5_read(var, raw))
+
+
+def era5_cut_areas(var: str, raw: bytes, areas: dict[str, list[float]]) -> dict[str, dict[tuple[int, int], bytes]]:
+    """One CDS file over a big box -> per area (north, west, south, east) its month files, each the same as if that
+    area had been asked on its own (ERA5-Land's 0.1 degree points do not move with the box)."""
     a, days, coords = era5_read(var, raw)
+    lat, lon = coords["latitude"], coords["longitude"]
+    out = {}
+    for region, (n, w, s, e) in areas.items():
+        iy = np.flatnonzero((lat <= n + 1e-6) & (lat >= s - 1e-6))
+        ix = np.flatnonzero((lon >= w - 1e-6) & (lon <= e + 1e-6))
+        sub_coords = {"latitude": lat[iy], "longitude": lon[ix]}
+        out[region] = _pack_by_month(var, a[:, iy][:, :, ix], days, sub_coords)
+    return out
+
+
+def _pack_by_month(var: str, a: np.ndarray, days: list[date], coords: dict) -> dict[tuple[int, int], bytes]:
     out = {}
     for ym in sorted({(d.year, d.month) for d in days}):
         idx = [i for i, d in enumerate(days) if (d.year, d.month) == ym]
@@ -362,71 +379,111 @@ def europe_complete(store) -> bool:
     return all(store.get(key_of("era5land", v, ERA5_FIRST_YEAR, 1)) is not None for v in VARS)
 
 
-def run_era5_world(store, minutes: float, years=None, parallel: int = 3, log=print, after_europe: bool = True) -> int:
-    """The world's wine belts (WORLD_AREAS), newest month first, a few requests at a time (Jasper: in parallel to
-    Europe's own job); each request with its own CDS client. Stops after 5 failures; the next run goes on."""
-    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+def world_box(areas) -> list[float]:
+    """The box (north, west, south, east) around the given areas."""
+    a = list(areas)
+    return [max(x[0] for x in a), min(x[1] for x in a), min(x[2] for x in a), max(x[3] for x in a)]
 
+
+def run_era5_world(
+    store, minutes: float, years=None, queue: int = 10, log=print, after_europe: bool = True, client=None, poll=30.0
+) -> int:
+    """The world's wine belts (WORLD_AREAS), newest month first: one request per variable and month for the box
+    around every area still missing it, cut into the areas here.
+
+    A month at a time: CDS puts a request of more months in its queue for large requests (22 Nov 2026: 1,419
+    waiting; none of our year requests started in four runs of 5.7 h). A month waits about an hour in the normal
+    queue (~2,000 requests, 60 running) and then runs in minutes, and our account runs one at a time; so up to
+    `queue` requests wait in CDS's queue at once. When the time is up, the ones not started yet are withdrawn, and
+    whatever is left when the run ends is deleted: nothing stays behind in CDS's queue. Stops after 5 failures."""
     # Jasper, 1 Nov 2026: "Europe first": the world waits until Europe's history is in (one CDS queue for both)
     if after_europe and not europe_complete(store):
         log("Europe's ERA5-Land history is not complete yet: the world waits")
         return 0
+    if client is None:
+        from ecmwf.datastores import Client
 
-    import cdsapi
+        client = Client(url=CDS_URL, key=os.environ["CDS_API_KEY"], progress=False, maximum_tries=5)
 
     stop = time.monotonic() + minutes * 60
+    hard = stop + 15 * 60  # the job's own limit is 25 minutes later
     have = set()
     for region in WORLD_AREAS:
         have |= set(store.list(f"climate/era5land/{region}/"))
     today = date.today()
     last = date(today.year, today.month, 1) - timedelta(days=1)
-    # one request per area, variable and year (the CDS queue waits about as long for a month as for a year; 1 Nov
-    # 2026: ~80 minutes), only the months still missing; stored per month as Europe's
     y1, y0 = years if years else (last.year, WORLD_FIRST_YEAR)
     todo = []
     for year in range(y1, y0 - 1, -1):
-        for region in WORLD_AREAS:
+        for month in range(12, 0, -1):
+            if date(year, month, 1) > last:
+                continue
             for var in VARS:
-                months = [m for m in range(1, 13) if date(year, m, 1) <= last]
-                months = [m for m in months if world_key(region, var, year, m) not in have]
-                if months:
-                    todo.append((region, var, year, months))
-    log(f"{len(todo)} world requests to go (a year, area and variable each)")
+                missing = [r for r in WORLD_AREAS if world_key(r, var, year, month) not in have]
+                if missing:
+                    todo.append((var, year, month, missing))
+    log(f"{len(todo)} world requests to go (a month and variable each)")
 
-    def fetch(job) -> str:
-        region, var, year, months = job
-        _, dataset, request = next(r for r in era5_requests(year, months, WORLD_AREAS[region]) if r[0] == var)
-        client = cdsapi.Client(url=CDS_URL, key=os.environ["CDS_API_KEY"], quiet=True, progress=False)
+    def save(remote, job) -> str:
+        var, year, month, regions = job
         with tempfile.TemporaryDirectory() as tmp:
             part = Path(tmp) / "cds.nc"
-            client.retrieve(dataset, request).download(str(part))
-            for (y, m), data in era5_pack_months(var, part.read_bytes()).items():
-                if y == year and m in months:
-                    store.put(world_key(region, var, y, m), data, "application/x-netcdf")
-        return f"{region} {var} {year} ({len(months)} months)"
+            remote.download(str(part))
+            areas = {r: WORLD_AREAS[r] for r in regions}
+            for region, months in era5_cut_areas(var, part.read_bytes(), areas).items():
+                if (year, month) in months:
+                    store.put(world_key(region, var, year, month), months[(year, month)], "application/x-netcdf")
+        return f"{var} {year}-{month:02d} ({len(regions)} areas)"
 
     done = failed = 0
     jobs = iter(todo)
-    with ThreadPoolExecutor(parallel) as ex:
-        running = {}
-        while True:
-            while len(running) < parallel and time.monotonic() < stop and failed < 5:
+    waiting: dict = {}  # remote -> job
+    try:
+        while failed < 5 and time.monotonic() < hard:
+            while len(waiting) < queue and time.monotonic() < stop:
                 job = next(jobs, None)
                 if job is None:
                     break
-                running[ex.submit(fetch, job)] = f"{job[0]} {job[1]} {job[2]}"
-            if not running:
-                return done
-            finished, _ = wait(running, return_when=FIRST_COMPLETED)
-            for f in finished:
-                key = running.pop(f)
+                var, year, month, regions = job
+                box = world_box(WORLD_AREAS[r] for r in regions)
+                _, dataset, request = next(r for r in era5_requests(year, month, box) if r[0] == var)
                 try:
-                    f.result()
-                    done += 1
-                    log(f"ok {key}")
+                    waiting[client.submit(dataset, request)] = job
                 except Exception as e:  # noqa: BLE001
                     failed += 1
-                    log(f"FAILED {key}: {e}")
+                    log(f"FAILED to ask {var} {year}-{month:02d}: {e}")
+                    break
+            if not waiting:
+                break
+            moved = False
+            for remote, job in list(waiting.items()):
+                status = remote.status
+                if status == "accepted" and time.monotonic() >= stop:  # time is up: withdraw what has not started
+                    remote.delete()
+                    del waiting[remote]
+                elif status == "successful":
+                    del waiting[remote]
+                    moved = True
+                    try:
+                        log(f"ok {save(remote, job)}")
+                        done += 1
+                    except Exception as e:  # noqa: BLE001
+                        failed += 1
+                        log(f"FAILED {job[0]} {job[1]}-{job[2]:02d}: {e}")
+                elif status in ("failed", "rejected", "dismissed", "deleted"):
+                    del waiting[remote]
+                    failed += 1
+                    log(f"FAILED {job[0]} {job[1]}-{job[2]:02d}: CDS says {status}")
+            if not moved and waiting:
+                time.sleep(poll)
+    finally:
+        for remote in waiting:  # nothing left behind in CDS's queue
+            try:
+                remote.delete()
+            except Exception:  # noqa: BLE001, S110
+                pass
+    log(f"{done} world months stored, {len(todo) - done} to go")
+    return done
 
 
 # ---------------------------------------------------------------- the laptop's downloads
@@ -543,7 +600,7 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("era5-world")
     p.add_argument("--years", type=int, nargs=2, metavar=("NEWEST", "OLDEST"))
     p.add_argument("--minutes", type=float, default=320)
-    p.add_argument("--parallel", type=int, default=3)
+    p.add_argument("--queue", type=int, default=10)
     for name in ("pack-knmi", "pack-era5"):
         p = sub.add_parser(name)
         p.add_argument("raw", type=Path)
@@ -558,7 +615,7 @@ def main(argv: list[str] | None = None) -> None:
         n = run_era5(store, a.minutes, a.years)
         report("era5land", store, f"{n} months written")
     elif a.cmd == "era5-world":
-        n = run_era5_world(store, a.minutes, a.years, a.parallel)
+        n = run_era5_world(store, a.minutes, a.years, a.queue)
         waiting = not europe_complete(store)  # the status page says why nothing came (Jasper: "Europe first")
         report("era5land-world", store, "waiting: Europe first" if waiting else f"{n} years written")
     elif a.cmd == "pack-knmi":

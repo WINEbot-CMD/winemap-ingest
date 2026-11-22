@@ -75,7 +75,8 @@ jobs:
           python -m winemap_ingest.climate era5 --minutes 320 ${{ inputs.years && format('--years {0}', inputs.years) || '' }}
 
   era5-world:
-    # the world's wine belts, 1991 -> now, newest first, 3 requests at a time (Jasper: in parallel to Europe's job)
+    # the world's wine belts, 1991 -> now, newest first, a month per request for the box around all areas
+    # (year requests never left CDS's large-request queue, 22 Nov 2026); up to 10 wait in CDS's queue at once
     if: github.event.schedule == '50 1,7,13,19 * * *' || (github.event_name == 'workflow_dispatch' && inputs.source == 'era5-world')
     runs-on: ubuntu-latest
     timeout-minutes: 345
@@ -101,7 +102,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           if [ -z "$R2_CLIMATE_ACCESS_KEY_ID" ] || [ -z "$CDS_API_KEY" ]; then echo "not set up yet: nothing to do"; exit 0; fi
-          python -m winemap_ingest.climate era5-world --minutes 320 --parallel 3 ${YEARS:+--years $YEARS}
+          python -m winemap_ingest.climate era5-world --minutes 320 --queue 10 ${YEARS:+--years $YEARS}
 
   era5-hourly:
     # winemap-nl docs/27 step 1: hourly temperature, dewpoint and rain for the disease and frost models
