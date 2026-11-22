@@ -139,6 +139,8 @@ def test_latest_version_per_day():
 
 
 class FakeRemote:
+    __hash__ = None  # like ecmwf.datastores' Remote (22 Nov 2026: it broke a dict of remotes)
+
     def __init__(self, request, plan):
         self.request, self.plan, self.deleted = request, list(plan), False
 
