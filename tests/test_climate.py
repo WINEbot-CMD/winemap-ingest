@@ -1,3 +1,4 @@
+import json
 from datetime import date
 
 import netCDF4
@@ -141,8 +142,8 @@ def test_latest_version_per_day():
 class FakeRemote:
     __hash__ = None  # like ecmwf.datastores' Remote (22 Nov 2026: it broke a dict of remotes)
 
-    def __init__(self, request, plan):
-        self.request, self.plan, self.deleted = request, list(plan), False
+    def __init__(self, request, plan, request_id="r"):
+        self.request, self.plan, self.deleted, self.request_id = request, list(plan), False, request_id
 
     @property
     def status(self):
@@ -160,7 +161,11 @@ class FakeClient:
         self.plan, self.remotes = plan, []
 
     def submit(self, dataset, request):
-        self.remotes.append(FakeRemote(request, self.plan))
+        self.remotes.append(FakeRemote(request, self.plan, f"r{len(self.remotes)}"))
+        return self.remotes[-1]
+
+    def get_remote(self, request_id):
+        self.remotes.append(FakeRemote(None, self.plan, request_id))
         return self.remotes[-1]
 
 
@@ -188,19 +193,25 @@ def test_world_download_a_month_per_request_for_the_box_around_the_missing_areas
     assert store.get(climate.world_key("na", "rr", 2025, 1)) is None
 
 
-def test_world_leaves_nothing_in_the_cds_queue_when_the_time_is_up(tmp_path):
-    client = FakeClient(plan=("accepted",))  # CDS never starts them
-    n = climate.run_era5_world(
-        LocalStore(tmp_path),
-        0.001,
-        years=(2024, 2024),
-        queue=4,
-        log=lambda *_: None,
-        after_europe=False,
-        client=client,
-        poll=0.01,
-    )
-    assert n == 0 and len(client.remotes) == 4 and all(r.deleted for r in client.remotes)
+def test_world_keeps_its_place_in_the_cds_queue_for_the_next_run(tmp_path, monkeypatch):
+    store = LocalStore(tmp_path)
+    monkeypatch.setattr(climate, "era5_cut_areas", lambda var, raw, areas: {r: {(2024, 12): b"packed"} for r in areas})
+    first = FakeClient(plan=("accepted",))  # CDS does not start them within this run
+    kw = dict(years=(2024, 2024), queue=4, log=lambda *_: None, after_europe=False, poll=0.01)
+    assert climate.run_era5_world(store, 0.001, client=first, **kw) == 0
+    assert len(first.remotes) == 4 and not any(r.deleted for r in first.remotes)
+    pending = json.loads(store.get(climate.WORLD_PENDING))
+    assert [p["id"] for p in pending] == ["r0", "r1", "r2", "r3"]
+    assert [(p["var"], p["month"]) for p in pending] == [("tg", 12), ("tn", 12), ("tx", 12), ("rr", 12)]
+
+    second = FakeClient()  # now they run; the four are picked up again, not asked anew
+    n = climate.run_era5_world(store, 5, client=second, **{**kw, "queue": 6})
+    picked = [r.request_id for r in second.remotes if r.request is None]
+    assert picked == ["r0", "r1", "r2", "r3"]
+    asked = [r.request for r in second.remotes if r.request is not None]
+    assert ("12",) not in {tuple(q["month"]) for q in asked}
+    assert n == len(climate.VARS) * 12 and json.loads(store.get(climate.WORLD_PENDING)) == []
+    assert store.get(climate.world_key("sa", "tx", 2024, 12)) == b"packed"
 
 
 def test_world_stops_after_five_failures(tmp_path):
