@@ -73,3 +73,19 @@ jobs:
           WX_STORE: r2
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python -m winemap_ingest.alerts
+      - name: Frost alarm push to growers' phones (winemap-nl docs/65 step 4)
+        if: always()
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: winemap-wx
+          WX_STORE: r2
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+          FROST_PUSH_KEY: ${{ secrets.FROST_PUSH_KEY }}  # live: only after the app release to live
+          SUPABASE_STAGING_URL: ${{ secrets.SUPABASE_STAGING_URL }}
+          SUPABASE_STAGING_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_STAGING_PUBLISHABLE_KEY }}
+          FROST_PUSH_KEY_STAGING: ${{ secrets.FROST_PUSH_KEY_STAGING }}
+        run: python -m winemap_ingest.push
